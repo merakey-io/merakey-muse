@@ -125,9 +125,11 @@ Only needed for the `spotify` subcommand.
 uv tool install spotdl      # or: pipx install spotdl
 ```
 
-Read the [Spotify caveat](#about-djdl-spotify) before relying on it — spotdl gives you YouTube audio
-wearing Spotify metadata, not Spotify audio. And see the
-[supply-chain section](#supply-chain-hardening) for the two spotdl flags you must never run.
+`djdl spotify <url>` then reads a **public** playlist by URL with **no login** — verified. Private
+playlists, Liked Songs and Spotify's own editorial playlists (`37i9dQZF…`) are out of reach on this
+path. Read the [Spotify caveat](#about-djdl-spotify) before relying on it — spotdl gives you YouTube
+audio wearing Spotify metadata, not Spotify audio, and can silently match the wrong version. And see
+the [supply-chain section](#supply-chain-hardening) for the two spotdl flags you must never run.
 
 ### 6. First run
 
@@ -358,9 +360,52 @@ the selection silently cancels.)
 
 ### About `djdl spotify`
 
-`spotdl` reads Spotify **metadata**, then sources the audio from YouTube. It does not decrypt
-Spotify. What you get is a YouTube match wearing Spotify tags, and the known failure mode is
-version mismatch — a radio edit where you wanted the extended mix. Verify what lands.
+```bash
+djdl spotify "https://open.spotify.com/playlist/…"   # public playlist, no login
+djdl vet        # catch bad-quality matches
+djdl analyze    # BPM + key
+```
+
+`djdl spotify <url>` reads a **public** playlist by URL with **no login at all** — verified live:
+spotdl enumerated a five-track public user playlist (returning real artist/title pairs, e.g.
+*LCD Soundsystem – All I Want*) with no credentials. Nothing to register, nothing to authorise.
+
+#### Public vs private is the whole split
+
+The no-login path only reaches **public** playlists. Private playlists, your Liked Songs, and
+"all my playlists at once" need OAuth — a Spotify developer app you register yourself for a client
+id/secret. **That OAuth path is not wired into `djdl` today.** It is a documented future option,
+not a shipped feature; if you need it now, drive `spotdl` directly.
+
+#### Your own playlist works — but it must be public *at download time*
+
+A playlist you created is user-created, so the public path reads it fine — the one requirement is
+that it is set to **public while you download**. In the Spotify app: right-click the playlist →
+**Share** → **Copy link** for the URL, and toggle public from the same menu. You can flip it back
+to private the moment the download finishes; public is only needed during the download itself.
+
+#### Spotify's own editorial/algorithmic playlists are blocked
+
+The `37i9dQZF…`-style playlists — Today's Top Hits, Discover Weekly, RapCaviar and the rest — will
+**hang or fail**, a consequence of Spotify's 2024-11-27 API changes. Only **user-created**
+playlists work. Your own playlists are user-created, so they are fine; a Spotify-curated one is
+not. If you test with "Today's Top Hits" and see a hang, this is why — not a broken install.
+
+#### You get YouTube audio, not Spotify audio
+
+`spotdl` reads Spotify **metadata** and then downloads the matched **YouTube** audio — it does not
+decrypt Spotify. So the [quality ceiling](#quality-ceiling--read-this-honestly) is YouTube's ~160k
+Opus, not Spotify's stream.
+
+The failure mode that specifically bites DJs: for tracks with multiple versions —
+remix / edit / live / sped-up — spotdl can **silently match the wrong one**. And note the gap
+precisely: [`djdl vet`](#djdl-vet--the-quality-gate) catches a bad-*quality* match but **not** a
+wrong-*version* match — the file is genuinely good audio, just of the wrong take. So for anything
+you intend to play out, **eyeball the filenames against what you expected**. Then run `djdl vet`
+and `djdl analyze` as above.
+
+See the [supply-chain section](#supply-chain-hardening) for the two `spotdl` flags you must never
+run.
 
 ## Quality ceiling — read this honestly
 
