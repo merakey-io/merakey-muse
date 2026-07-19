@@ -14,7 +14,28 @@ djdl sync https://youtube.com/playlist?list=… "Warmup"
 djdl vet
 ```
 
-## Install
+## Setup
+
+macOS or Linux. Takes about two minutes.
+
+### 1. Prerequisites
+
+`ffmpeg` does the single Opus→FLAC decode; `jq` parses search results. Both are required.
+
+```bash
+# macOS
+brew install ffmpeg jq
+
+# Debian/Ubuntu
+sudo apt install ffmpeg jq
+```
+
+You do **not** need to install yt-dlp yourself — the installer handles it, and deliberately
+uses the standalone binary rather than a brew or pip package so it can self-update to nightly.
+That matters: YouTube extractor breakage is routinely fixed in nightly days before it reaches a
+stable release, and a stale binary is the single most common cause of "it stopped working".
+
+### 2. Install
 
 ```bash
 git clone https://github.com/merakey-io/merakey-muse.git
@@ -22,12 +43,74 @@ cd merakey-muse
 ./install.sh
 ```
 
-The installer checks for `ffmpeg` and `jq`, installs the yt-dlp standalone binary to
-`~/.local/bin/yt-dlp` and updates it to nightly, links `djdl` onto your PATH, creates
-`~/Music/DJ/Incoming`, and installs the config — **without overwriting an existing
-`~/Music/DJ/yt-dlp.conf`**. It finishes by running `djdl doctor`.
+The installer is idempotent — safe to re-run. It:
 
-`spotdl` is optional and only needed for the `spotify` subcommand: `uv tool install spotdl`.
+- verifies `ffmpeg` and `jq`, failing with install hints if either is missing
+- downloads the yt-dlp standalone binary to `~/.local/bin/yt-dlp` and updates it to nightly
+- links `djdl` onto your PATH at `~/.local/bin/djdl`
+- creates `~/Music/DJ/Incoming`
+- installs `config/yt-dlp.conf` to `~/Music/DJ/yt-dlp.conf`, **never overwriting an existing
+  one** — if you've tuned yours, it says so and prints a `diff` command instead
+- warns if `~/.local/bin` is not on your PATH, with the line to add to your shell rc
+- finishes by running `djdl doctor`
+
+By default `djdl` is **symlinked** into the repo, so `git pull` updates the installed command
+with no re-install. The tradeoff is that moving or deleting the clone breaks the command. For a
+detached copy instead:
+
+```bash
+MUSE_COPY=1 ./install.sh
+```
+
+### 3. Verify
+
+```bash
+djdl doctor
+```
+
+Every line should be green, ending with `extractor healthy`. If `~/.local/bin` wasn't on your
+PATH, open a new terminal after adding it. If the extractor probe fails, run `djdl update` — that
+fixes it the large majority of the time.
+
+### 4. Optional: Spotify support
+
+Only needed for the `spotify` subcommand.
+
+```bash
+uv tool install spotdl      # or: pipx install spotdl
+```
+
+Read the [Spotify caveat](#about-djdl-spotify) before relying on it — spotdl gives you YouTube audio
+wearing Spotify metadata, not Spotify audio.
+
+### 5. First run
+
+```bash
+djdl search "artist track name"     # pick a row by number, Enter to cancel
+djdl vet                            # check what landed
+open ~/Music/DJ/Incoming            # drag into rekordbox
+```
+
+## Using it with Claude Code
+
+`djdl` is built to be driven conversationally. From the repo directory:
+
+```bash
+claude
+```
+
+Then tell Claude:
+
+> Read the README, then help me find and download music with `djdl`. Search for tracks, show me
+> the results, and download the ones I pick.
+
+Claude runs the search, shows you the numbered table, and pipes your selection back in — so you
+just say *"find me Peggy Gou — Starry Night"* and then *"grab 2 and 4."* This works because the
+picker reads plain stdin (see [Driving the picker non-interactively](#driving-the-picker-non-interactively)).
+
+Claude is genuinely useful for the judgement calls here: picking the official upload over an
+`(HQ)` reupload, spotting a pitch-shifted or sped-up rip in the results, and reading `djdl vet`
+output to decide what to delete before importing.
 
 ## The core design constraint: rekordbox cannot import Opus
 
