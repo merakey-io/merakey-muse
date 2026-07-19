@@ -55,21 +55,33 @@ run_dl() {
 # ── search ────────────────────────────────────────────────────────────────
 # Queries a provider, renders a numbered table, downloads the chosen rows.
 cmd_search() {
-  local provider="ytsearch" n=12
+  local provider="ytsearch" n=12 label="youtube"
   while [[ "${1:-}" == -* ]]; do
     case "$1" in
-      -m|--music) provider="ytmsearch"; shift ;;   # YouTube Music: cleaner tags
-      -s|--sc)    provider="scsearch";  shift ;;   # SoundCloud: edits & bootlegs
+      -m|--music) provider="ytmusic"; label="yt-music"; shift ;;
+      -s|--sc)    provider="scsearch"; label="soundcloud"; shift ;;
       -n)         n="$2"; shift 2 ;;
       *) die "unknown flag: $1" ;;
     esac
   done
   [[ $# -gt 0 ]] || die "usage: djdl search [-m|-s] [-n N] <query>"
 
-  local query="$*"
-  info "searching ${provider%search} for \"$query\" ..."
+  local query="$*" target
+  case "$provider" in
+    ytmusic)
+      # There is NO `ytmsearch:` prefix in yt-dlp — it fails with
+      # "Unsupported url scheme". Plenty of guides claim otherwise; they are
+      # wrong. YouTube Music is only reachable through a music.youtube.com
+      # search URL, served by the youtube:music:search_url extractor.
+      local q; q=$(jq -rn --arg s "$query" '$s|@uri')
+      target="https://music.youtube.com/search?q=$q" ;;
+    *)
+      target="${provider}${n}:${query}" ;;
+  esac
+
+  info "searching $label for \"$query\" ..."
   local json
-  json=$("$YTDLP" -q --no-warnings --flat-playlist -j "${provider}${n}:${query}" 2>/dev/null)
+  json=$("$YTDLP" -q --no-warnings --flat-playlist --playlist-end "$n" -j "$target" 2>/dev/null)
   [[ -n "$json" ]] || die "no results (or extractor blocked — try: djdl update)"
 
   local -a urls=() titles=()
@@ -96,7 +108,11 @@ cmd_search() {
     [[ -n "$warn" ]] && wtag=$(printf "%s ⚠ %-13s%s" "$c_wa" "$warn" "$c_rs")
     printf "%s%3d%s  %s%-7s%s %s%-20.20s%s %s%.52s\n" \
       "$c_hd" "$i" "$c_rs" "$c_dm" "$mmss" "$c_rs" "$c_dm" "${uploader:0:20}" "$c_rs" "$wtag" "$title"
-  done < <(echo "$json" | jq -r '[(.url // .webpage_url // ("https://youtu.be/"+.id)), (.duration//"?"), (.uploader // .channel // .uploader_id // "?"), .title] | @tsv')
+  # YT Music search mixes album/artist browse entries (MPRE… ids, no title)
+  # in with tracks; drop anything untitled so the picker only offers playables.
+  done < <(echo "$json" | jq -r 'select((.title // "") != "")
+    | [(.url // .webpage_url // ("https://youtu.be/"+.id)), (.duration//"?"),
+       (.uploader // .channel // .artists[0]? // .uploader_id // "?"), .title] | @tsv')
 
   [[ $i -gt 0 ]] || die "no parseable results"
   printf "\n%sPick: numbers (1 3 5), range (1-4), 'a' all, Enter cancel: %s" "$c_hd" "$c_rs" >&2

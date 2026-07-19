@@ -75,7 +75,7 @@ One rule, correct for YouTube and SoundCloud alike. Nothing that leaves this too
 
 | Command | What it does |
 |---|---|
-| `djdl search [-m\|-s] [-n N] <query>` | Search, render a numbered table, pick rows, download. `-m` = YouTube Music (cleanest tags), `-s` = SoundCloud (edits, bootlegs), default = YouTube. `-n N` sets result count (default 12). Selection accepts numbers (`1 3 5`), ranges (`1-4`), `a` for all, Enter to cancel. |
+| `djdl search [-m\|-s] [-n N] <query>` | Search, render a numbered table, pick rows, download. `-m` = YouTube Music, `-s` = SoundCloud (edits, bootlegs), default = YouTube. `-n N` sets result count (default 12). Selection accepts numbers (`1 3 5`), ranges (`1-4`), `a` for all, Enter to cancel. |
 | `djdl get <url>...` | Download URLs directly, same pipeline. |
 | `djdl sync <playlist-url> [name]` | Idempotent playlist sync into `~/Music/DJ/Playlists/<name>/`. Re-run any time; the archive skips what you already have. |
 | `djdl spotify <url>` | Spotify playlist via `spotdl`. |
@@ -83,6 +83,23 @@ One rule, correct for YouTube and SoundCloud alike. Nothing that leaves this too
 | `djdl ls` | What's staged in `Incoming`, with sizes and archive count. |
 | `djdl update` | `yt-dlp --update-to nightly`. First thing to try when extraction breaks. |
 | `djdl doctor` | Health check — versions, config presence, free space, and a live YouTube extractor probe. |
+
+### There is no `ytmsearch:` prefix — another wrong-but-popular claim
+
+`-m` used to build a `ytmsearch12:` query. That scheme **does not exist in yt-dlp** and fails with
+`Unsupported url scheme: "ytmsearch"`. Plenty of guides and answers assert it works; they are wrong.
+`yt-dlp --list-extractors | grep -i search` shows what is real: there is `youtube:search`,
+`soundcloud:search` (so `ytsearch:` and `scsearch:` are both genuine prefixes), but for YouTube Music
+only `youtube:music:search_url` — a URL extractor, not a prefix. `-m` therefore builds a
+`https://music.youtube.com/search?q=…` URL instead.
+
+Two consequences worth knowing:
+
+- YT Music search returns album and artist *browse* entries (`MPRE…` ids, no title) mixed in with
+  tracks. Untitled entries are filtered out so the picker only offers playable rows.
+- `--flat-playlist` metadata from YT Music and SoundCloud omits duration and uploader, so those rows
+  show `?:??` / `?` and the duration-based `long/loop?` warning cannot fire. Plain YouTube search
+  returns both. Judge `-m` and `-s` results by title alone.
 
 ### Search result warnings
 
