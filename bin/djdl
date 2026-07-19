@@ -100,8 +100,12 @@ cmd_search() {
 
   [[ $i -gt 0 ]] || die "no parseable results"
   printf "\n%sPick: numbers (1 3 5), range (1-4), 'a' all, Enter cancel: %s" "$c_hd" "$c_rs" >&2
+  # Plain stdin read: works when stdin is the terminal AND when a selection
+  # is piped in (`echo 2 | djdl search ...`), which is how automation and
+  # agents drive it. Reading from /dev/tty instead breaks the piped case —
+  # the test can pass while the read itself fails, silently cancelling.
   local pick=""
-  if [[ -r /dev/tty ]]; then read -r pick </dev/tty || true; else read -r pick || true; fi
+  read -r pick || true
   [[ -n "${pick// }" ]] || { info "cancelled"; return 0; }
 
   local -a sel=()
@@ -161,13 +165,23 @@ cmd_spotify() {
 # 96kbps MP3 re-wrapped as FLAC looks pristine to rekordbox, which will
 # happily analyse it and keep it in your library forever.
 #
-# The tell is spectral. Every lossy encoder lowpasses; the lower the bitrate
-# the lower the cutoff (~15kHz at 96k, ~20kHz for YouTube's 160k Opus). We
-# measure energy above 17kHz against full-band energy. Measured separation on
-# a known pair: -40dB for a genuine source vs -60dB for a 96k transcode.
-# A gentle `highpass` is useless here — it leaks bass into the measurement
-# and collapses the gap to ~3dB, hence the 4-stage 2-pole chain.
-STEEP_HP="highpass=f=17000:poles=2,highpass=f=17000:poles=2,highpass=f=17000:poles=2,highpass=f=17000:poles=2"
+# The tell is spectral. Every lossy encoder lowpasses, and the lower the
+# bitrate the lower the cutoff (~15kHz at 96k, ~20kHz for YouTube's 160k Opus).
+#
+# We measure the SLOPE between 13kHz and 19kHz, NOT the absolute level up
+# there. Absolute level is a trap: quiet treble usually just means quiet
+# CONTENT. Measured on three real files:
+#     genuine bright music   13k=-30.7  19k=-49.6   slope -18.9
+#     solo piano (legit)     13k=-56.6  19k=-71.3   slope -14.7
+#     96k transcode          13k=-34.7  19k=-79.5   slope -44.8
+# The piano sits 26dB lower than the bright track yet has the same gentle
+# slope. Only a codec lowpass produces a cliff. An absolute-level threshold
+# flags every sparse-treble track — piano, dub, ambient — as fake, which is
+# exactly the false positive this replaced.
+#
+# A gentle `highpass` is useless here: it leaks bass into the measurement and
+# collapses the gap to ~3dB, hence the 4-stage 2-pole chain per probe point.
+hp_at() { printf 'highpass=f=%s:poles=2,highpass=f=%s:poles=2,highpass=f=%s:poles=2,highpass=f=%s:poles=2' "$1" "$1" "$1" "$1"; }
 
 cmd_vet() {
   local dir="${1:-$INCOMING}"
@@ -195,9 +209,12 @@ cmd_vet() {
     local seek=(-ss 30 -t 60)
     [[ "${dur%%.*}" -lt 100 ]] 2>/dev/null && seek=()
 
+    local hi13 hi19
     full=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" -af volumedetect -f null - 2>&1 \
       | grep -m1 mean_volume | grep -oE '\-?[0-9.]+ dB' | grep -oE '\-?[0-9.]+')
-    hi=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" -af "$STEEP_HP,volumedetect" -f null - 2>&1 \
+    hi13=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" -af "$(hp_at 13000),volumedetect" -f null - 2>&1 \
+      | grep -m1 mean_volume | grep -oE '\-?[0-9.]+ dB' | grep -oE '\-?[0-9.]+')
+    hi19=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" -af "$(hp_at 19000),volumedetect" -f null - 2>&1 \
       | grep -m1 mean_volume | grep -oE '\-?[0-9.]+ dB' | grep -oE '\-?[0-9.]+')
 
     local eb
@@ -205,17 +222,20 @@ cmd_vet() {
     lufs=$(grep -A6 'Integrated loudness' <<<"$eb" | grep -m1 ' I: ' | grep -oE '\-?[0-9.]+')
     peak=$(grep -A3 'True peak' <<<"$eb" | grep -m1 'Peak:' | grep -oE '\-?[0-9.]+')
 
+    # slope = how fast energy falls from 13kHz to 19kHz. A codec lowpass is a
+    # cliff; real content — however dark — tapers.
     delta=""
-    if [[ -n "$full" && -n "$hi" ]]; then
-      delta=$(python3 -c "print(round($hi-($full),1))" 2>/dev/null)
+    if [[ -n "$hi13" && -n "$hi19" ]]; then
+      delta=$(python3 -c "print(round($hi19-($hi13),1))" 2>/dev/null)
     fi
 
-    # Verdicts, worst-first.
+    # Verdicts, worst-first. Thresholds sit between the measured genuine
+    # cases (-14.7, -18.9) and the measured transcode (-44.8), with margin.
     local verdict="" vcol="$c_ok"
     if [[ -n "$delta" ]]; then
-      if   (( $(python3 -c "print(1 if $delta <= -55 else 0)") )); then
+      if   (( $(python3 -c "print(1 if $delta <= -35 else 0)") )); then
         verdict="lossy source (~<128k)"; vcol="$c_er"
-      elif (( $(python3 -c "print(1 if $delta <= -50 else 0)") )); then
+      elif (( $(python3 -c "print(1 if $delta <= -28 else 0)") )); then
         verdict="marginal HF"; vcol="$c_wa"
       else
         verdict="ok"; vcol="$c_ok"
@@ -248,7 +268,7 @@ cmd_vet() {
     printf "%-34.34s %-6s %5s %7s %7s  %s%s%s\n" \
       "$base" "$codec" "$((${sr:-0}/1000))" "${lufs:-?}" "${peak:-?}" "$vcol" "$verdict" "$c_rs"
   done
-  printf "%sHF delta thresholds: >-50 ok · -50..-55 marginal · <-55 lossy source%s\n" "$c_dm" "$c_rs"
+  printf "%s13k→19k slope: >-28 ok · -28..-35 marginal · <-35 codec cliff (lossy source)%s\n" "$c_dm" "$c_rs"
 }
 
 # ── housekeeping ──────────────────────────────────────────────────────────

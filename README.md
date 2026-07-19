@@ -92,6 +92,20 @@ and BPM that are simply **wrong**, silently poisoning harmonic mixing. Flagged:
 `pitch-shifted` (432Hz), `tempo-altered` (nightcore / sped up / slowed / reverb),
 `long/loop?` (over 12 minutes), `live rip`.
 
+### Driving the picker non-interactively
+
+The selection prompt reads plain stdin, so a choice can simply be piped in:
+
+```bash
+echo "1 3" | djdl search -m "artist track"
+echo 2 | djdl search "artist track"
+```
+
+Same syntax as the interactive prompt — numbers, ranges, `a` for all. This makes `search`
+scriptable and lets agents drive it without a terminal. (Reading from `/dev/tty` instead would
+break this: the `[[ -r /dev/tty ]]` test passes under a pipe while the read itself fails, and
+the selection silently cancels.)
+
 ### About `djdl spotify`
 
 `spotdl` reads Spotify **metadata**, then sources the audio from YouTube. It does not decrypt
@@ -137,27 +151,45 @@ spectrum is one of the main things that buys the bitrate saving — and the lowe
 the lower the cutoff. Roughly 15kHz at 96kbps; roughly 20kHz for YouTube's 160kbps Opus. A
 genuinely lossless source has content running all the way up.
 
-So `vet` measures energy above 17kHz against full-band energy and reports the difference in dB.
-On a controlled pair built during development — one genuine source, and the *same audio*
-transcoded to 96kbps and re-wrapped as FLAC — the separation was unambiguous:
+So `vet` measures the **slope** of that rolloff: it probes energy above 13kHz and above 19kHz,
+and reports how many dB the signal falls between the two. A codec lowpass is a **cliff**. Real
+content — however dark — **tapers**.
 
-| File | HF delta |
+**The obvious approach is wrong, and it produced a real false positive.** The first version of
+this thresholded on the *absolute* level above 17kHz: quiet up there meant fake. It flagged the
+first genuine track it was ever run against — a solo ragtime piano piece from a perfectly
+legitimate 133kbps Opus YouTube stream — as a lossy source. Quiet treble almost always means
+quiet **content**, not a codec artifact. Sparse-HF material is everywhere: solo piano, dub,
+ambient, anything softly played or darkly mastered. An absolute threshold condemns all of it.
+
+Measured on three real files:
+
+| File | 13kHz | 19kHz | Slope |
+|---|---|---|---|
+| genuine bright music | -30.7 dB | -49.6 dB | **-18.9 dB** |
+| solo piano (legitimate, sparse HF) | -56.6 dB | -71.3 dB | **-14.7 dB** |
+| 96k transcode re-wrapped as FLAC | -34.7 dB | -79.5 dB | **-44.8 dB** |
+
+This is the whole argument in one table. The piano sits **26dB lower** than the bright track in
+absolute terms — which is exactly what got it wrongly flagged — yet its slope is just as gentle,
+in fact slightly gentler. Only the transcode falls off a cliff. Slope separates the codec from
+the content; absolute level cannot.
+
+| 13kHz→19kHz slope | Verdict |
 |---|---|
-| genuine source | **-40 dB** |
-| same audio, 96k transcode re-wrapped as FLAC | **-60 dB** |
+| better than -28 dB | `ok` |
+| -28 to -35 dB | `marginal HF` |
+| below -35 dB | `lossy source` |
 
-| HF delta | Verdict |
-|---|---|
-| better than -50 dB | `ok` |
-| -50 to -55 dB | `marginal HF` |
-| below -55 dB | `lossy source` |
+Thresholds sit in the wide gap between the measured genuine cases (-14.7, -18.9) and the
+measured transcode (-44.8), with margin on both sides. All three files classify correctly.
 
-**Implementation note, worth recording because it is easy to get wrong:** this measurement
+**Implementation note, worth recording because it is easy to get wrong:** each probe point
 requires a *steep* filter — a 4-stage chain of 2-pole highpasses. A single `highpass` is a
-gentle rolloff, not a wall. It leaks bass energy straight into the "above 17kHz" measurement,
-and since bass dominates the energy of most tracks, that leakage swamps the signal you are
-looking for. It collapses the real 20dB gap to about 3dB and the test becomes useless. If you
-ever touch `STEEP_HP`, this is what you are protecting.
+gentle rolloff, not a wall. It leaks bass energy straight into the measurement, and since bass
+dominates the energy of most tracks, that leakage swamps the signal you are looking for. It
+collapses the real gap to about 3dB and the test becomes useless. This applies at **both** the
+13kHz and 19kHz probes — if you ever touch `hp_at`, this is what you are protecting.
 
 ### 2. Dual-mono
 
