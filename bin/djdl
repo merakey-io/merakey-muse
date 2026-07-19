@@ -47,8 +47,21 @@ META_ARGS=(
 # --download-archive must be absolute: -P governs output paths but not the
 # archive, so a relative path resolves against CWD and scatters .archive.txt
 # across whatever directory you invoked from.
+# Hardening, applied to every invocation:
+#   --no-plugin-dirs      yt-dlp imports ALL plugins found in user-writable
+#                         dirs whether or not they are invoked, performs no
+#                         checks on their code, and extractor plugins take
+#                         PRIORITY over built-ins — so a dropped file can
+#                         silently hijack YouTube handling. No flag needed to
+#                         enable them, which is why they must be turned off.
+#   --no-remote-components  no fetching of remote JS components at runtime.
+# Also note what is deliberately absent everywhere in this script: --exec,
+# --netrc-cmd and --write-*-link. --exec in particular has had four separate
+# shell-injection breaks; the rule here is never to use it, not to use it
+# carefully.
 run_dl() {
   "$YTDLP" -P "$DJ_ROOT" --download-archive "$DJ_ROOT/.archive.txt" \
+    --no-plugin-dirs --no-remote-components \
     "${META_ARGS[@]}" "$@"
 }
 
@@ -287,6 +300,225 @@ cmd_vet() {
   printf "%s13k→19k slope: >-28 ok · -28..-35 marginal · <-35 codec cliff (lossy source)%s\n" "$c_dm" "$c_rs"
 }
 
+# ── scan ──────────────────────────────────────────────────────────────────
+# Integrity / safety checks on downloaded files. Deliberately NOT an
+# antivirus: the realistic risks for audio pulled by yt-dlp are a truncated
+# or corrupt file, a container that isn't what its extension claims, and
+# malformed embedded cover art (image parsers are a far bigger attack
+# surface than audio decoders). Each check below either passes or names
+# something concrete — nothing here is decorative.
+cmd_scan() {
+  local dir="${1:-$INCOMING}"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+
+  local -a files=()
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(
+    find "$dir" -type f \( -name '*.flac' -o -name '*.m4a' -o -name '*.mp3' \
+      -o -name '*.wav' -o -name '*.aiff' \) -print0 2>/dev/null)
+  [[ ${#files[@]} -gt 0 ]] || { info "no audio files in $dir"; return 0; }
+
+  local bad=0
+  for f in "${files[@]}"; do
+    local base issues=() ext mime probe magic
+    base=$(basename "$f"); ext="${f##*.}"
+    ext=$(tr 'A-Z' 'a-z' <<<"$ext")
+
+    # 1. Does the container match the extension? Catches a renamed file or a
+    #    polyglot whose extension misrepresents its real contents.
+    mime=$(file -b --mime-type "$f" 2>/dev/null)
+
+    # ffprobe is NOT authoritative for content type — it falls back to
+    # extension-based detection. A shell script named .flac probes as "flac".
+    # It does warn ("Format flac detected only with low score of 1"), but at
+    # warning level, so `-v quiet` hides exactly the signal that matters.
+    # file(1) is the authority; ffprobe's low-score line is corroboration.
+    local probe_raw
+    probe_raw=$(ffprobe -v warning -show_entries format=format_name -of csv=p=0 "$f" 2>&1)
+    probe=$(tail -1 <<<"$probe_raw")
+    grep -q 'low score' <<<"$probe_raw" && \
+      issues+=("ffprobe low-score detection — extension misrepresents contents")
+    [[ -z "$probe" ]] && issues+=("not decodable as audio")
+    case "$ext" in
+      flac) [[ "$mime" == audio/flac  || "$probe" == *flac* ]] || issues+=("ext/container mismatch: $mime/$probe") ;;
+      m4a)  [[ "$mime" == audio/*     || "$probe" == *mp4*  ]] || issues+=("ext/container mismatch: $mime/$probe") ;;
+      mp3)  [[ "$mime" == audio/mpeg  || "$probe" == *mp3*  ]] || issues+=("ext/container mismatch: $mime/$probe") ;;
+    esac
+
+    # 2. Executable magic inside something claiming to be audio. Mach-O,
+    #    ELF, PE and shebangs have no business at the head of a music file.
+    magic=$(xxd -l 4 -p "$f" 2>/dev/null)
+    case "$magic" in
+      cffaedfe|cefaedfe|feedface|feedfacf|cafebabe) issues+=("MACH-O EXECUTABLE HEADER") ;;
+      7f454c46) issues+=("ELF EXECUTABLE HEADER") ;;
+      4d5a*)    issues+=("PE/DOS EXECUTABLE HEADER") ;;
+      2321*)    issues+=("SHEBANG — script, not audio") ;;
+    esac
+
+    # 3. Full decode. Truncated or corrupt files import into rekordbox and
+    #    then fail mid-set, which is the worst possible time to find out.
+    local derr
+    derr=$(ffmpeg -v error -i "$f" -f null - 2>&1 | head -2)
+    [[ -n "$derr" ]] && issues+=("decode errors: $(tr '\n' ' ' <<<"$derr" | cut -c1-60)")
+
+    # 4. Embedded cover art must be a real image. A malformed one is the
+    #    most plausible hostile payload in a music file, since it is handed
+    #    straight to an image parser by every player that shows artwork.
+    if ffprobe -v quiet -select_streams v -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null | grep -q .; then
+      local tmpimg="${TMPDIR:-/tmp}/djdl_art_$$"
+      if ffmpeg -v error -y -i "$f" -an -vcodec copy -f image2 "$tmpimg" 2>/dev/null; then
+        file -b "$tmpimg" 2>/dev/null | grep -qiE 'image|bitmap' || issues+=("embedded art is NOT a valid image")
+      fi
+      rm -f "$tmpimg"
+    fi
+
+    # 5. Foreign payload appended after the audio stream — the polyglot
+    #    pattern used in real campaigns: a file that is simultaneously a
+    #    playable MP3 and an executable script. Players read from offset 0
+    #    and play it; another interpreter scans deeper and executes.
+    #    Reporting the byte OFFSET is the point — it marks where the audio
+    #    ended and something else began. Note the payload half of these is
+    #    typically Windows-targeted and inert on macOS, but a hit is a
+    #    high-confidence "deliberately constructed" signal either way.
+    #    Do NOT try to derive this from ffprobe packet offsets: the demuxer
+    #    absorbs appended junk, so trailing bytes always compute to zero.
+    local hit
+    hit=$(LC_ALL=C grep -aboE 'PK\x03\x04|PK\x05\x06|\x7fELF|<script|<html|<HTA:|#!/bin/|mshta|powershell' "$f" 2>/dev/null | head -1)
+    [[ -n "$hit" ]] && issues+=("foreign payload at byte offset ${hit%%:*}")
+
+    # 6. macOS quarantine. PROVENANCE ONLY, never a verdict: opening a
+    #    quarantined non-executable triggers no Gatekeeper check, and
+    #    yt-dlp doesn't set the xattr at all — so its absence means nothing.
+    xattr -p com.apple.quarantine "$f" >/dev/null 2>&1 && issues+=("quarantine xattr — arrived via browser/AirDrop, not yt-dlp")
+
+    if [[ ${#issues[@]} -eq 0 ]]; then
+      printf "%s  ✓%s %.60s\n" "$c_ok" "$c_rs" "$base"
+    else
+      bad=$((bad+1))
+      printf "%s  ✗%s %.60s\n" "$c_er" "$c_rs" "$base"
+      local i; for i in "${issues[@]}"; do printf "%s      %s%s\n" "$c_wa" "$i" "$c_rs"; done
+    fi
+  done
+  echo
+  if [[ $bad -eq 0 ]]; then
+    # Deliberately not a green "SAFE" badge. These checks cover file-shape
+    # problems; they do not and cannot cover malformed-bitstream parser
+    # exploits (e.g. the CoreAudio zero-click class), where the trigger is
+    # indistinguishable from ordinary corruption. Implying otherwise would
+    # be exactly the theater this is trying to avoid.
+    printf "%s%d file(s): no structural problems found%s\n" "$c_ok" "${#files[@]}" "$c_rs"
+  else
+    printf "%s%d of %d file(s) have issues%s\n" "$c_er" "$bad" "${#files[@]}" "$c_rs"
+  fi
+  cat <<EOF
+${c_dm}This checks file shape, not exploits. Parser-level attacks are undetectable
+by scanning — the control for those is patching macOS and ffmpeg.
+The larger real risk is supply chain: yt-dlp and spotdl execute code on this
+machine. Run 'djdl doctor' for those checks.${c_rs}
+EOF
+}
+
+# ── analyze ───────────────────────────────────────────────────────────────
+# BPM + loudness per track, cached. rekordbox does its own authoritative
+# analysis on import, so this exists to inform decisions BEFORE that —
+# which tracks sit in the same tempo range, and how loud they are relative
+# to each other for gain staging.
+ANALYSIS="$DJ_ROOT/.analysis.tsv"
+ENGINE="${YTDLP%/*}/djdl-engine"
+ENGINE_PY="$HOME/.local/share/muse-venv/bin/python"
+
+cmd_analyze() {
+  [[ -x "$ENGINE_PY" ]] || die "muse venv missing. Run: uv venv --python 3.14 ~/.local/share/muse-venv && VIRTUAL_ENV=~/.local/share/muse-venv uv pip install essentia"
+  local dir="${1:-$INCOMING}"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+  local -a files=()
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(
+    find "$dir" -type f \( -name '*.flac' -o -name '*.m4a' -o -name '*.mp3' \
+      -o -name '*.wav' -o -name '*.aiff' \) -print0 2>/dev/null)
+  [[ ${#files[@]} -gt 0 ]] || { info "no audio files in $dir"; return 0; }
+
+  info "analysing ${#files[@]} track(s) with Essentia (BPM + key) ..."
+  "$ENGINE_PY" "$ENGINE" analyze "${files[@]}" > "$ANALYSIS"
+
+  printf "%s%-42s %7s %6s %6s %6s%s\n" "$c_hd" "TRACK" "BPM" "CONF" "KEY" "CLASS" "$c_rs"
+  # Low rhythm confidence means the BPM is a guess — beatless or rubato
+  # material. A trailing * on key confidence means the two key profiles
+  # disagreed, which is the honest signal that the key is unreliable.
+  tail -n +2 "$ANALYSIS" | while IFS=$'\t' read -r path bpm conf cam cls kc; do
+    local b col
+    b=$(basename "$path"); b="${b%.*}"
+    col="$c_ok"
+    awk -v c="$conf" 'BEGIN{exit !(c<1.5)}' && col="$c_wa"
+    printf "%-42.42s %7s %s%6s%s %6s %6s\n" "$b" "$bpm" "$col" "$conf" "$c_rs" "$cam" "$cls"
+  done
+  printf "%sconf <1.5 = unreliable BPM (beatless/rubato) · key* = profiles disagreed%s\n" "$c_dm" "$c_rs"
+  printf "%scached in %s%s\n" "$c_dm" "$ANALYSIS" "$c_rs"
+}
+
+# ── similar ───────────────────────────────────────────────────────────────
+# Deezer related-artists. Keyless: no signup, no token, no OAuth. Chosen over
+# Spotify (whose /recommendations and /audio-features were withdrawn for new
+# apps in Nov 2024), ListenBrainz (weaker on electronic) and Last.fm (whose
+# ToS caps stored data, so a cached similarity graph would breach it).
+cmd_similar() {
+  [[ $# -gt 0 ]] || die "usage: djdl similar <artist>"
+  "$ENGINE_PY" "$ENGINE" similar "$@"
+}
+
+# ── mix ───────────────────────────────────────────────────────────────────
+# Rank the analysed library by how well each track follows a seed.
+cmd_mix() {
+  [[ -f "$ANALYSIS" ]] || die "no analysis yet — run: djdl analyze"
+  local seed_bpm seed_key
+  if [[ "${1:-}" =~ ^[0-9.]+$ ]]; then
+    seed_bpm="$1"; seed_key="${2:-8A}"
+  else
+    [[ $# -gt 0 ]] || die "usage: djdl mix <bpm> <camelot> | djdl mix <track-substring>"
+    local row; row=$(grep -i -m1 -F "$1" "$ANALYSIS") || die "no analysed track matching: $1"
+    seed_bpm=$(cut -f2 <<<"$row"); seed_key=$(cut -f4 <<<"$row")
+    local seed_path; seed_path=$(cut -f1 <<<"$row")
+    info "seed: $(basename "$seed_path")  ${seed_bpm} BPM  ${seed_key}"
+    # Exclude the seed from its own ranking — it would always score 100.
+    grep -vF "$seed_path" "$ANALYSIS" | "$ENGINE_PY" "$ENGINE" compat "$seed_bpm" "$seed_key"
+    return
+  fi
+  "$ENGINE_PY" "$ENGINE" compat "$seed_bpm" "$seed_key" < "$ANALYSIS"
+}
+
+# ── gain ──────────────────────────────────────────────────────────────────
+# Writes ReplayGain 2.0 tags (EBU R128, -18 LUFS reference) in place.
+cmd_gain() {
+  command -v rsgain >/dev/null 2>&1 || die "rsgain not installed. Run: brew install rsgain"
+  local dir="${1:-$INCOMING}"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+  info "writing ReplayGain 2.0 tags (track gain, EBU R128) ..."
+  rsgain easy "$dir"
+  ok "tagged → $dir"
+}
+
+# ── rbxml ─────────────────────────────────────────────────────────────────
+# Emits a rekordbox-importable XML collection. Import is ADDITIVE and
+# non-destructive: rekordbox shows it as a separate browsable panel and
+# nothing enters the real collection until you explicitly import. Tracks are
+# referenced in place, never copied.
+cmd_rbxml() {
+  local helper="${YTDLP%/*}/djdl-rbxml"
+  [[ -x "$helper" ]] || die "djdl-rbxml not found next to djdl"
+  DJ_ROOT="$DJ_ROOT" "$helper" "$@" || return 1
+  cat <<EOF
+
+${c_hd}To import in rekordbox 7:${c_rs}
+  1. Preferences > View > Layout    -> tick "rekordbox xml"
+  2. Preferences > Advanced > Database > Imported Library > Browse
+     -> select ${DJ_ROOT}/rekordbox.xml
+  3. The tree appears in the left sidebar under "rekordbox xml".
+     Right-click tracks > "Import To Collection".
+
+${c_wa}Known rekordbox bug:${c_rs} tracks already in your collection are NOT updated
+on re-import. Select the tracks inside the playlist and import those, rather
+than importing the playlist node, or the update is silently skipped.
+EOF
+}
+
 # ── housekeeping ──────────────────────────────────────────────────────────
 cmd_ls() {
   local count; count=$(find "$INCOMING" -type f \
@@ -308,8 +540,49 @@ cmd_doctor() {
   printf "  spotdl   %s\n" "$(command -v spotdl >/dev/null && echo ok || echo '- (uv tool install spotdl)')"
   printf "  config   %s\n" "$([[ -f "$DJ_ROOT/yt-dlp.conf" ]] && echo ok || echo MISSING)"
   printf "  free     %s\n" "$(df -h "$DJ_ROOT" | tail -1 | awk '{print $4}')"
+  # ── supply chain ────────────────────────────────────────────────────────
+  # This matters more than scanning the audio files. yt-dlp and spotdl
+  # execute code here; the downloaded FLACs do not.
+  printf "\n%s── supply chain ──%s\n" "$c_hd" "$c_rs"
+
+  # ffmpeg < 8.1.2 carries CVE-2026-8461 (heap OOB write in the MagicYUV
+  # decoder, RCE demonstrated from a 50KB file). `djdl scan` and `vet` both
+  # decode untrusted input, so a stale ffmpeg turns those into a liability.
+  # Strictly-less-than: `sort -V -C` alone treats equal as sorted, so an
+  # exactly-patched version would report as vulnerable.
+  local fv; fv=$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')
+  if [[ -n "$fv" && "$fv" != "8.1.2" ]] && printf '%s\n8.1.2\n' "$fv" | sort -V -C; then
+    printf "  %sffmpeg %s < 8.1.2 — CVE-2026-8461 (RCE via crafted media).%s\n" "$c_er" "$fv" "$c_rs"
+    printf "  %sFix: brew upgrade ffmpeg%s\n" "$c_wa" "$c_rs"
+  else
+    printf "  %s✓%s ffmpeg %s (>= 8.1.2, PixelSmash patched)\n" "$c_ok" "$c_rs" "$fv"
+  fi
+
+  # yt-dlp advisory floor: 2026.07.04 fixes the --exec shell-injection
+  # (GHSA-69qj-pvh9-c5wg) and --write-link (CVE-2026-55404).
+  local yv; yv=$("$YTDLP" --version 2>/dev/null | cut -d@ -f1)
+  if [[ -n "$yv" ]] && printf '%s\n2026.07.04\n' "$yv" | sort -V -C && [[ "$yv" != "2026.07.04" ]]; then
+    printf "  %s⚠%s yt-dlp %s is below the 2026.07.04 advisory floor — run: djdl update\n" "$c_wa" "$c_rs" "$yv"
+  else
+    printf "  %s✓%s yt-dlp %s (>= 2026.07.04 advisory floor)\n" "$c_ok" "$c_rs" "$yv"
+  fi
+
+  # Plugins are arbitrary Python, imported whether or not invoked, with no
+  # code checks, and extractor plugins OVERRIDE built-ins. djdl passes
+  # --no-plugin-dirs on every call, so this is belt-and-braces.
+  local pd
+  pd=$("$YTDLP" --ignore-config -v --simulate "https://youtu.be/jNQXAC9IVRw" 2>&1 \
+       | grep -m1 'Plugin directories:' | sed 's/.*Plugin directories: //')
+  if [[ "$pd" == "none" || -z "$pd" ]]; then
+    printf "  %s✓%s no yt-dlp plugin directories present\n" "$c_ok" "$c_rs"
+  else
+    printf "  %s⚠%s yt-dlp plugins found: %s — these auto-execute and override extractors\n" "$c_wa" "$c_rs" "$pd"
+  fi
+  printf "  %s✓%s djdl hardening: --no-plugin-dirs --no-remote-components, never --exec\n" "$c_ok" "$c_rs"
+
+  printf "\n"
   info "probing YouTube extractor ..."
-  if "$YTDLP" -q --no-warnings --simulate "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>/dev/null; then
+  if "$YTDLP" -q --no-warnings --no-plugin-dirs --simulate "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>/dev/null; then
     ok "extractor healthy (no PO token needed)"
   else
     printf "%s⚠ extraction failed — run 'djdl update' first; if it persists you may\n" "$c_wa"
@@ -323,6 +596,12 @@ case "${1:-help}" in
   sync)      shift; cmd_sync "$@" ;;
   spotify|sp) shift; cmd_spotify "$@" ;;
   vet|v)     shift; cmd_vet "$@" ;;
+  scan)      shift; cmd_scan "$@" ;;
+  analyze|an) shift; cmd_analyze "$@" ;;
+  gain)      shift; cmd_gain "$@" ;;
+  rbxml|xml) shift; cmd_rbxml "$@" ;;
+  similar|sim) shift; cmd_similar "$@" ;;
+  mix|next)  shift; cmd_mix "$@" ;;
   ls|list)   cmd_ls ;;
   update|up) cmd_update ;;
   doctor|dr) cmd_doctor ;;
@@ -338,6 +617,14 @@ ${c_hd}djdl${c_rs} — rekordbox-oriented music acquisition
   ${c_hd}vet${c_rs} [dir]                       quality gate: detects lossy
                                    sources laundered into FLAC, dual-mono,
                                    clipping; reports LUFS for gain staging
+  ${c_hd}scan${c_rs} [dir]                      integrity check: container vs
+                                   extension, executable headers, decode
+                                   errors, malformed cover art, quarantine
+  ${c_hd}analyze${c_rs} [dir]                   BPM + key (Camelot) via Essentia
+  ${c_hd}mix${c_rs} <track|bpm camelot>         rank library by what mixes next
+  ${c_hd}similar${c_rs} <artist>                related artists (Deezer, keyless)
+  ${c_hd}gain${c_rs} [dir]                      write ReplayGain 2.0 tags
+  ${c_hd}rbxml${c_rs} [dir] [out.xml]           export a rekordbox XML collection
   ${c_hd}ls${c_rs}                              what's staged in Incoming
   ${c_hd}update${c_rs}                          yt-dlp -> nightly
   ${c_hd}doctor${c_rs}                          health check

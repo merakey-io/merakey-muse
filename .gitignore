@@ -1,7 +1,26 @@
+# Library state — never belongs in the repo
 .archive.txt
+.analysis.tsv
+rekordbox.xml
+Incoming/
+Playlists/
+
+# Audio
 *.flac
 *.m4a
 *.mp3
 *.wav
+*.aiff
+*.aif
+*.alac
+*.opus
+*.webm
+
+# Python / venv
+__pycache__/
+*.pyc
+muse-venv/
+.venv/
+venv/
+
 .DS_Store
-Incoming/

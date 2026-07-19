@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""djdl analysis + compatibility + discovery engine.
+
+Run under the muse venv (Essentia). Subcommands:
+    analyze <files...>      BPM, key (Camelot), confidence  -> TSV on stdout
+    compat  <bpm> <camelot> [energy]   score library tracks against a seed
+    similar <artist>        Deezer related artists (keyless)
+
+Findings that shaped this, each of which cost a wrong first attempt somewhere:
+
+  * Constrain the tempo search to ONE octave. Every detector defaults into the
+    wrong octave on ambiguous material (174 BPM DnB reported as 87). This
+    single setting fixes more errors than any tool choice.
+  * Use the `edma` key profile (Beatport/EDM-derived), never the classical
+    default, and never `edmm` despite the name — it has a severe minor-key
+    bias and mislabels clean major progressions as their relative minor.
+  * Run two profiles and trust agreement. Where they disagree they usually
+    disagree into the RELATIVE major/minor, which Camelot treats as a valid
+    mix anyway — the cheapest possible error.
+  * A plain weighted mean is WRONG for compatibility. Perfect BPM and energy
+    will outvote a tritone key clash and recommend it. The weighted sum must
+    pass through multiplicative gates so a harmonic clash is disqualifying.
+  * Pitching to match tempo TRANSPOSES the track: ±6% (the CDJ default range)
+    is 12*log2(1.06) = 1.009 semitones, which is 7 positions around the
+    Camelot wheel. At intermediate drift the track is not in another key —
+    it is out of tune with itself, which is worse than either neighbour.
+"""
+import sys, os, json, math, subprocess, urllib.request, urllib.parse
+
+# ── Camelot wheel ─────────────────────────────────────────────────────────
+# Validated on two invariants: relative major/minor = -3 semitones, and
+# +1 wheel step = +7 semitones (perfect fifth).
+CAMELOT = {
+    ("Ab","minor"):"1A", ("G#","minor"):"1A",  ("B","major"):"1B",
+    ("Eb","minor"):"2A", ("D#","minor"):"2A",  ("F#","major"):"2B", ("Gb","major"):"2B",
+    ("Bb","minor"):"3A", ("A#","minor"):"3A",  ("Db","major"):"3B", ("C#","major"):"3B",
+    ("F","minor"):"4A",                        ("Ab","major"):"4B", ("G#","major"):"4B",
+    ("C","minor"):"5A",                        ("Eb","major"):"5B", ("D#","major"):"5B",
+    ("G","minor"):"6A",                        ("Bb","major"):"6B", ("A#","major"):"6B",
+    ("D","minor"):"7A",                        ("F","major"):"7B",
+    ("A","minor"):"8A",                        ("C","major"):"8B",
+    ("E","minor"):"9A",                        ("G","major"):"9B",
+    ("B","minor"):"10A",                       ("D","major"):"10B",
+    ("F#","minor"):"11A", ("Gb","minor"):"11A",("A","major"):"11B",
+    ("C#","minor"):"12A", ("Db","minor"):"12A",("E","major"):"12B",
+}
+# rekordbox's Tonality field needs CLASSICAL notation; Camelot is display-only
+# in its UI and a Camelot string there fails silently as an unparseable value.
+CLASSICAL = {v: (k[0] + ("m" if k[1] == "minor" else "")) for k, v in CAMELOT.items()}
+
+
+def parse_camelot(c):
+    c = (c or "").strip().upper()
+    if len(c) < 2 or c[-1] not in "AB":
+        return None
+    try:
+        return int(c[:-1]), c[-1]
+    except ValueError:
+        return None
+
+
+def harmonic_score(a, b):
+    """0-100 for how well key b follows key a, plus a human reason."""
+    pa, pb = parse_camelot(a), parse_camelot(b)
+    if not pa or not pb:
+        return 50.0, "unknown key"
+    na, la = pa; nb, lb = pb
+    d = (nb - na) % 12
+    if na == nb and la == lb:               return 100.0, "same key"
+    if la == lb and d in (1, 11):           return 95.0, "adjacent (perfect 5th)"
+    if na == nb and la != lb:               return 90.0, "relative major/minor"
+    if la == lb and d == 2:                 return 78.0, "energy boost (+2)"
+    if la == lb and d == 10:                return 74.0, "energy drop (-2)"
+    if la != lb and d in (1, 11):           return 70.0, "diagonal"
+    if d == 6:                              return 8.0,  "TRITONE CLASH"
+    if la == lb and d in (3, 9):            return 40.0, "distant (3 steps)"
+    return 22.0, f"clash ({d} steps)"
+
+
+def bpm_score(a, b, allow_half=True):
+    """Tempo compatibility, accounting for half/double-time as a real move."""
+    if not a or not b:
+        return 50.0, "unknown bpm", 0.0
+    ratio, note = b / a, ""
+    if allow_half:
+        for mult, lbl in ((2.0, "double-time"), (0.5, "half-time")):
+            if abs(math.log2((b * mult) / a)) < abs(math.log2(ratio)):
+                ratio, note = (b * mult) / a, lbl
+    pct = abs(ratio - 1.0) * 100
+    # Semitones of transposition induced by pitching b to a's tempo.
+    drift = 12 * math.log2(ratio)
+    if   pct <= 1:  s = 100.0
+    elif pct <= 3:  s = 100 - (pct - 1) * 7.5
+    elif pct <= 6:  s = 85 - (pct - 3) * 15
+    else:           s = max(0.0, 40 - (pct - 6) * 6)
+    if note:
+        s *= 0.85            # valid but deliberate; small penalty
+    return s, (note or f"{pct:.1f}% pitch"), drift
+
+
+DETUNE_DEADZONE = 0.25   # semitones; ~1.5% tempo change
+
+
+def detune_penalty(drift):
+    """Key drift that is not a whole semitone leaves the track out of tune
+    with ITSELF — worse than landing cleanly in a neighbouring key.
+
+    Below DETUNE_DEADZONE the shift is inaudible and standard DJ practice,
+    so it must cost nothing: penalising it made a same-key match at 0.4%
+    pitch score 92 instead of 100, and pushed a perfect-fifth move BELOW a
+    relative major/minor one. The penalty is about landing between semitones
+    at large drift, not about touching the pitch fader at all.
+    """
+    if abs(drift) < DETUNE_DEADZONE:
+        return 1.0
+    off = abs(drift - round(drift))          # distance to nearest semitone
+    return 1.0 - 0.45 * min(off / 0.5, 1.0)
+
+
+def score(seed, cand, keylock=False):
+    sb, sk, se = seed
+    cb, ck, ce = cand
+    b, bnote, drift = bpm_score(sb, cb)
+    eff = ck
+    if not keylock and abs(drift) >= 0.5:
+        p = parse_camelot(ck)
+        if p:                                   # +1 semitone = +7 wheel steps
+            n, l = p
+            eff = f"{((n - 1 + round(drift) * 7) % 12) + 1}{l}"
+    h, hnote = harmonic_score(sk, eff)
+    e = 100.0 - min(abs((ce or 5) - (se or 5)), 5) * 12
+
+    total = 0.45 * h + 0.35 * b + 0.20 * e
+    # Gates. Without these a tritone clash with perfect BPM scores ~55 and
+    # gets recommended. Real mixing does not average — a key clash is
+    # disqualifying, and the gate is what encodes that.
+    total *= 0.35 + 0.65 * (h / 100) ** 0.5
+    total *= 0.40 + 0.60 * (b / 100) ** 0.5
+    if not keylock:
+        total *= detune_penalty(drift)
+    reason = hnote + (f" via {eff}" if eff != ck else "") + f", {bnote}"
+    return round(total, 1), round(h, 1), round(b, 1), reason
+
+
+# ── analysis ──────────────────────────────────────────────────────────────
+def analyze(paths, lo=110, hi=180):
+    import essentia.standard as es
+    print("path\tbpm\tconf\tcamelot\tclassical\tkeyconf")
+    for p in paths:
+        try:
+            audio = es.MonoLoader(filename=p, sampleRate=44100)()
+            bpm, _, conf, _, _ = es.RhythmExtractor2013(
+                method="multifeature", minTempo=lo, maxTempo=hi)(audio)
+            k1, s1, st1 = es.KeyExtractor(profileType="edma")(audio)
+            k2, s2, _   = es.KeyExtractor(profileType="bgate")(audio)
+            cam = CAMELOT.get((k1, s1), "?")
+            # Profile disagreement is the honest signal that the key is a guess.
+            agree = (k1, s1) == (k2, s2)
+            print(f"{p}\t{bpm:.2f}\t{conf:.2f}\t{cam}\t{CLASSICAL.get(cam,'')}"
+                  f"\t{st1:.2f}{'' if agree else '*'}")
+        except Exception as ex:
+            print(f"{p}\t?\t?\t?\t?\t{type(ex).__name__}", file=sys.stderr)
+
+
+# ── discovery ─────────────────────────────────────────────────────────────
+def deezer(artist, limit=15):
+    """Deezer related-artists. Keyless — no signup, no token, no OAuth."""
+    def get(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "djdl/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    q = urllib.parse.quote(artist)
+    s = get(f"https://api.deezer.com/search/artist?q={q}&limit=1")
+    if not s.get("data"):
+        sys.exit(f"artist not found on Deezer: {artist}")
+    a = s["data"][0]
+    print(f"seed: {a['name']}  (deezer id {a['id']})", file=sys.stderr)
+    rel = get(f"https://api.deezer.com/artist/{a['id']}/related?limit={limit}")
+    for x in rel.get("data", []):
+        print(f"{x['name']}\t{x.get('nb_fan',0)}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    cmd = sys.argv[1]
+    if cmd == "analyze":
+        analyze(sys.argv[2:])
+    elif cmd == "similar":
+        deezer(" ".join(sys.argv[2:]))
+    elif cmd == "compat":
+        sb = float(sys.argv[2]); sk = sys.argv[3]
+        se = float(sys.argv[4]) if len(sys.argv) > 4 else 5
+        rows = []
+        for line in sys.stdin:
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 4 or f[0] == "path":
+                continue
+            try:
+                cb = float(f[1])
+            except ValueError:
+                continue
+            ck = f[3]
+            s, h, b, why = score((sb, sk, se), (cb, ck, 5))
+            rows.append((s, h, b, cb, ck, why, os.path.basename(f[0])))
+        rows.sort(reverse=True)
+        print(f"{'SCORE':>6} {'HARM':>5} {'BPM':>5}  {'TRACK':<34} {'BPM':>6} {'KEY':>4}  WHY")
+        for s, h, b, cb, ck, why, name in rows:
+            print(f"{s:6.1f} {h:5.0f} {b:5.0f}  {name[:34]:<34} {cb:6.1f} {ck:>4}  {why}")
+    else:
+        sys.exit(f"unknown subcommand: {cmd}")
+
+
+if __name__ == "__main__":
+    main()

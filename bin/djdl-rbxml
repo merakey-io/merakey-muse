@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Generate a rekordbox-importable XML collection from a directory of audio.
+
+Format facts below are from Pioneer's official xml_format_list.pdf and were
+verified against a real rekordbox 7.2.11 binary. The non-obvious ones:
+
+  * Location MUST be "file://localhost/" + percent-encoded UTF-8, safe=":/".
+  * Rating is 0/51/102/153/204/255 for 0-5 stars. Writing "4" gives 0 stars.
+  * Tonality is CLASSICAL notation ("Am", "F#m"). Camelot ("8A") is a display
+    preference in the rekordbox UI, never a storage format — feeding it Camelot
+    yields a blank or junk key, and it fails silently because Tonality is a
+    free string field.
+  * TotalTime must be set or cue points misbehave.
+  * COLLECTION/@Entries and NODE/@Count/@Entries must equal real child counts;
+    mismatches cause truncated or empty imports.
+  * Numbers must be locale-independent (dot decimal). A comma decimal from a
+    de_DE/pt_BR locale corrupts the beatgrid.
+  * Import is ADDITIVE and non-destructive: the XML appears as a separate
+    browsable panel, and nothing enters the real collection until the user
+    explicitly imports. Tracks are referenced in place, never copied.
+
+Deliberately NOT emitted: TEMPO (beatgrid) elements. A TEMPO marker needs an
+accurate first-downbeat position, and a slightly-wrong Inizio produces a
+phase-shifted grid — actively worse than no grid, because rekordbox trusts it.
+AverageBpm is still written (useful for sorting and filtering); rekordbox
+builds the authoritative beatgrid on analysis.
+"""
+import os
+import sys
+import subprocess
+import datetime
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+AUDIO_EXTS = {".flac", ".m4a", ".mp3", ".wav", ".aiff", ".aif"}
+KIND = {".flac": "FLAC File", ".m4a": "M4A File", ".mp3": "MP3 File",
+        ".wav": "WAV File", ".aiff": "AIFF File", ".aif": "AIFF File"}
+
+
+def ffprobe(path):
+    """Return {tag_or_field: value} for one file, or {} if unreadable."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", path],
+            capture_output=True, text=True, timeout=60).stdout
+        import json
+        return json.loads(out) if out.strip() else {}
+    except Exception:
+        return {}
+
+
+def location_uri(path):
+    """rekordbox Location URI.
+
+    Percent-encode the path with ':' and '/' left safe. quote() encodes the
+    UTF-8 bytes, which is what rekordbox expects for non-ASCII names like
+    "Abdução". Never use quote_plus: '+' for space breaks path resolution.
+
+    We do NOT unicode-normalize. The filesystem's own byte sequence is the
+    only representation guaranteed correct across APFS, HFS+ and exFAT — and
+    exFAT (the DJ USB standard) is normalization-SENSITIVE, so normalizing
+    here would break exactly the case that matters most.
+    """
+    return "file://localhost/" + urllib.parse.quote(os.path.abspath(path).lstrip("/"), safe=":/")
+
+
+def load_analysis(dj_root):
+    """BPM + key cache written by `djdl analyze`, keyed by absolute path.
+
+    Returns {path: (bpm, classical_key)}. The key is written to Tonality in
+    CLASSICAL notation, never Camelot — rekordbox's Tonality field is a free
+    string, so a Camelot value there fails silently rather than erroring.
+
+    Worth supplying: rekordbox's own key detection benchmarks around 70%
+    (59.9% strict), so an externally-computed key is a real improvement.
+    Rekordbox is authoritative for BEATGRID, not for key.
+    """
+    out = {}
+    p = os.path.join(dj_root, ".analysis.tsv")
+    if not os.path.exists(p):
+        return out
+    with open(p, encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 5 and parts[0] != "path":
+                try:
+                    out[parts[0]] = (float(parts[1]), parts[4])
+                except ValueError:
+                    pass
+    return out
+
+
+def build(files, dj_root, playlist_name):
+    root = ET.Element("DJ_PLAYLISTS", Version="1.0.0")
+    ET.SubElement(root, "PRODUCT", Name="merakey-muse", Version="1.0", Company="Merakey")
+    collection = ET.SubElement(root, "COLLECTION")
+
+    bpms = load_analysis(dj_root)
+    tracks, skipped = [], []
+
+    for i, path in enumerate(sorted(files), start=1):
+        meta = ffprobe(path)
+        if not meta.get("streams"):
+            skipped.append((path, "not decodable"))
+            continue
+
+        audio = next((s for s in meta["streams"] if s.get("codec_type") == "audio"), {})
+        fmt = meta.get("format", {})
+        tags = {k.lower(): v for k, v in (fmt.get("tags") or {}).items()}
+
+        st = os.stat(path)
+        ext = os.path.splitext(path)[1].lower()
+        dur = float(fmt.get("duration") or 0)
+
+        # bit_rate is absent on some FLACs; derive from size/duration.
+        br = fmt.get("bit_rate") or audio.get("bit_rate")
+        bitrate = int(int(br) / 1000) if br else (int(st.st_size * 8 / dur / 1000) if dur else 0)
+
+        attrs = {
+            "TrackID": str(i),
+            "Name": tags.get("title") or os.path.splitext(os.path.basename(path))[0],
+            "Artist": tags.get("artist", ""),
+            "Composer": tags.get("composer", ""),
+            "Album": tags.get("album", ""),
+            "Grouping": "",
+            "Genre": tags.get("genre", ""),
+            "Kind": KIND.get(ext, "Unknown"),
+            "Size": str(st.st_size),
+            "TotalTime": str(int(round(dur))),      # required, else cues misbehave
+            "DiscNumber": "0",
+            "TrackNumber": tags.get("track", "0").split("/")[0] or "0",
+            "Year": (tags.get("date", "") or "")[:4],
+            "AverageBpm": f"{bpms[path][0]:.2f}" if path in bpms else "",
+            "DateModified": datetime.date.fromtimestamp(st.st_mtime).isoformat(),
+            "DateAdded": datetime.date.fromtimestamp(st.st_mtime).isoformat(),
+            "BitRate": str(bitrate),
+            "SampleRate": str(float(audio.get("sample_rate", 44100))),
+            "Comments": "",
+            "PlayCount": "0",
+            "LastPlayed": "",
+            "Rating": "0",                          # 0/51/102/153/204/255 only
+            "Location": location_uri(path),         # the one required attribute
+            "Remixer": "",
+            "Tonality": bpms[path][1] if path in bpms else "",   # CLASSICAL only
+            "Label": tags.get("label", ""),
+            "Mix": "",
+        }
+        # ElementTree escapes &, <, > and quotes in attribute values for us —
+        # unescaped "&" in an artist name is the top cause of a hard parse
+        # failure ("unable to be read properly").
+        ET.SubElement(collection, "TRACK", **{k: str(v) for k, v in attrs.items()})
+        tracks.append(str(i))
+
+    collection.set("Entries", str(len(tracks)))
+
+    playlists = ET.SubElement(root, "PLAYLISTS")
+    rootnode = ET.SubElement(playlists, "NODE", Type="0", Name="ROOT", Count="1")
+    pl = ET.SubElement(rootnode, "NODE", Type="1", Name=playlist_name,
+                       Entries=str(len(tracks)), KeyType="0")
+    for tid in tracks:
+        # KeyType="0" means Key holds a TrackID. Preferred over KeyType="1"
+        # (Location URI) because it sidesteps path-string matching entirely.
+        ET.SubElement(pl, "TRACK", Key=tid)
+
+    return root, tracks, skipped
+
+
+def main():
+    dj_root = os.environ.get("DJ_ROOT", os.path.expanduser("~/Music/DJ"))
+    src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(dj_root, "Incoming")
+    out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(dj_root, "rekordbox.xml")
+    name = os.path.basename(os.path.normpath(src)) or "muse"
+
+    if not os.path.isdir(src):
+        sys.exit(f"not a directory: {src}")
+
+    files = [os.path.join(dp, f)
+             for dp, _, fns in os.walk(src)
+             for f in fns if os.path.splitext(f)[1].lower() in AUDIO_EXTS]
+    if not files:
+        sys.exit(f"no audio files in {src}")
+
+    root, tracks, skipped = build(files, dj_root, name)
+
+    ET.indent(root, space="  ")
+    # UTF-8, no BOM. A BOM ahead of the declaration chokes the parser.
+    with open(out, "wb") as fh:
+        fh.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+        fh.write(ET.tostring(root, encoding="utf-8", xml_declaration=False))
+
+    print(f"{len(tracks)} track(s) -> {out}")
+    for p, why in skipped:
+        print(f"  skipped: {os.path.basename(p)} ({why})")
+
+
+if __name__ == "__main__":
+    main()
