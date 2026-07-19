@@ -11,6 +11,7 @@ idempotent archive so re-runs never re-download.
 djdl search -m "peggy gou starry night"
 djdl get https://soundcloud.com/…
 djdl sync https://youtube.com/playlist?list=… "Warmup"
+djdl vet
 ```
 
 ## Install
@@ -78,6 +79,7 @@ One rule, correct for YouTube and SoundCloud alike. Nothing that leaves this too
 | `djdl get <url>...` | Download URLs directly, same pipeline. |
 | `djdl sync <playlist-url> [name]` | Idempotent playlist sync into `~/Music/DJ/Playlists/<name>/`. Re-run any time; the archive skips what you already have. |
 | `djdl spotify <url>` | Spotify playlist via `spotdl`. |
+| `djdl vet [dir]` | Quality gate. Analyses every audio file in `dir` (default `~/Music/DJ/Incoming`) and flags lossy sources laundered into FLAC, dual-mono, mono, and true-peak clipping — plus integrated LUFS for every track. |
 | `djdl ls` | What's staged in `Incoming`, with sizes and archive count. |
 | `djdl update` | `yt-dlp --update-to nightly`. First thing to try when extraction breaks. |
 | `djdl doctor` | Health check — versions, config presence, free space, and a live YouTube extractor probe. |
@@ -109,6 +111,102 @@ came from.
 For tracks you actually intend to play out on a real system, **buy them**: Bandcamp, Beatport,
 Qobuz, or the artist directly. This tool is for discovery, references, edits and bootlegs that
 have no commercial release — not for building the library you rely on.
+
+## `djdl vet` — the quality gate
+
+```bash
+djdl vet                    # ~/Music/DJ/Incoming
+djdl vet ~/Music/DJ/Playlists/Warmup
+```
+
+Files arrive from a lot of places, and the file extension tells you almost nothing about what
+is actually inside. `vet` opens each one and reports what it finds, in a single table.
+
+### 1. Lossy sources laundered into FLAC
+
+This is the headline feature and the reason the command exists.
+
+**A FLAC container proves nothing about what went into it.** Someone can take a 96kbps MP3,
+decode it, and re-wrap the result as FLAC. The file is now genuinely lossless — losslessly
+preserving audio that was already destroyed. It reports as 44.1kHz/16-bit FLAC, it is 30MB,
+rekordbox imports it without complaint, and it sounds like a 96kbps MP3 on a club system.
+Nothing in the metadata will ever tell you.
+
+The tell is spectral. **Every lossy encoder lowpasses** — throwing away the top of the
+spectrum is one of the main things that buys the bitrate saving — and the lower the bitrate,
+the lower the cutoff. Roughly 15kHz at 96kbps; roughly 20kHz for YouTube's 160kbps Opus. A
+genuinely lossless source has content running all the way up.
+
+So `vet` measures energy above 17kHz against full-band energy and reports the difference in dB.
+On a controlled pair built during development — one genuine source, and the *same audio*
+transcoded to 96kbps and re-wrapped as FLAC — the separation was unambiguous:
+
+| File | HF delta |
+|---|---|
+| genuine source | **-40 dB** |
+| same audio, 96k transcode re-wrapped as FLAC | **-60 dB** |
+
+| HF delta | Verdict |
+|---|---|
+| better than -50 dB | `ok` |
+| -50 to -55 dB | `marginal HF` |
+| below -55 dB | `lossy source` |
+
+**Implementation note, worth recording because it is easy to get wrong:** this measurement
+requires a *steep* filter — a 4-stage chain of 2-pole highpasses. A single `highpass` is a
+gentle rolloff, not a wall. It leaks bass energy straight into the "above 17kHz" measurement,
+and since bass dominates the energy of most tracks, that leakage swamps the signal you are
+looking for. It collapses the real 20dB gap to about 3dB and the test becomes useless. If you
+ever touch `STEEP_HP`, this is what you are protecting.
+
+### 2. Dual-mono
+
+Two channels carrying an identical signal: a stereo file with no stereo image at all. Fine on
+laptop speakers, immediately obvious on a club rig.
+
+Detected via the **side signal** (L−R). If the side is effectively silent (below -70dB), the
+two channels are identical. The obvious alternative — comparing per-channel RMS — is **wrong**,
+and worth stating plainly: a wide, properly mixed stereo track can easily have near-equal RMS
+in both channels while being nothing like dual-mono. Equal energy is not equal signal.
+
+### 3. Mono
+
+Flagged plainly as `MONO`. No detection subtlety here, but you want it in the table.
+
+### 4. True peak above 0 dBTP
+
+Flagged as `+peak`. Inter-sample peaks over full scale will clip on D/A conversion and again in
+the CDJ's own limiter. Common in loud masters, but you want to know before it is in the mix,
+not during.
+
+### 5. Integrated LUFS
+
+Reported for every track, whether or not anything is flagged. This is gain staging: knowing
+your tracks sit at, say, -8 and -14 LUFS before you play them means you are not discovering it
+by riding the trim mid-transition.
+
+### Limitations — stated honestly
+
+`vet` analyses a **60-second window starting at 0:30**. That skips intros and lead-in silence
+(which would poison the spectral measurement) and bounds runtime across a large folder. The
+consequence is real: it characterises the **body of the track**, not every moment of it. A file
+that is clean in its middle minute and broken elsewhere will pass.
+
+It also **reports rather than deletes**. Nothing is ever removed automatically — the verdicts
+are information for you to act on.
+
+### Workflow
+
+```bash
+djdl search -m "…"     # acquire
+djdl vet               # inspect what actually landed
+                       # delete the flagged junk yourself
+                       # then import ~/Music/DJ/Incoming into rekordbox
+```
+
+Vetting before import matters more than it sounds: once rekordbox has analysed a track and
+written it into the collection, removing it cleanly is far more annoying than never importing
+it. Gate at `Incoming`.
 
 ## Gotchas discovered the hard way
 

@@ -156,6 +156,101 @@ cmd_spotify() {
   ok "done → $INCOMING  ${c_wa}(verify versions — YT matching is imperfect)${c_rs}"
 }
 
+# ── vet ───────────────────────────────────────────────────────────────────
+# Quality gate. A FLAC container proves nothing about what went into it: a
+# 96kbps MP3 re-wrapped as FLAC looks pristine to rekordbox, which will
+# happily analyse it and keep it in your library forever.
+#
+# The tell is spectral. Every lossy encoder lowpasses; the lower the bitrate
+# the lower the cutoff (~15kHz at 96k, ~20kHz for YouTube's 160k Opus). We
+# measure energy above 17kHz against full-band energy. Measured separation on
+# a known pair: -40dB for a genuine source vs -60dB for a 96k transcode.
+# A gentle `highpass` is useless here — it leaks bass into the measurement
+# and collapses the gap to ~3dB, hence the 4-stage 2-pole chain.
+STEEP_HP="highpass=f=17000:poles=2,highpass=f=17000:poles=2,highpass=f=17000:poles=2,highpass=f=17000:poles=2"
+
+cmd_vet() {
+  local dir="${1:-$INCOMING}"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+
+  local -a files=()
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(
+    find "$dir" -type f \( -name '*.flac' -o -name '*.m4a' -o -name '*.mp3' \
+      -o -name '*.wav' -o -name '*.aiff' -o -name '*.alac' \) -print0 2>/dev/null)
+  [[ ${#files[@]} -gt 0 ]] || { info "no audio files in $dir"; return 0; }
+
+  printf "%s%-34s %-6s %5s %7s %7s  %s%s\n" "$c_hd" \
+    "TRACK" "CODEC" "kHz" "LUFS" "PEAK" "VERDICT" "$c_rs"
+
+  local f base probe codec sr ch dur full hi delta lufs peak rms_l rms_r
+  for f in "${files[@]}"; do
+    base=$(basename "$f"); base="${base%.*}"
+    probe=$(ffprobe -v quiet -select_streams a:0 \
+      -show_entries stream=codec_name,sample_rate,channels:format=duration \
+      -of default=nw=1:nk=1 "$f" 2>/dev/null)
+    codec=$(sed -n 1p <<<"$probe"); sr=$(sed -n 2p <<<"$probe")
+    ch=$(sed -n 3p <<<"$probe");    dur=$(sed -n 4p <<<"$probe")
+
+    # Analyse a 60s window from 0:30 — skips intros/silence, bounds runtime.
+    local seek=(-ss 30 -t 60)
+    [[ "${dur%%.*}" -lt 100 ]] 2>/dev/null && seek=()
+
+    full=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" -af volumedetect -f null - 2>&1 \
+      | grep -m1 mean_volume | grep -oE '\-?[0-9.]+ dB' | grep -oE '\-?[0-9.]+')
+    hi=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" -af "$STEEP_HP,volumedetect" -f null - 2>&1 \
+      | grep -m1 mean_volume | grep -oE '\-?[0-9.]+ dB' | grep -oE '\-?[0-9.]+')
+
+    local eb
+    eb=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" -af ebur128=peak=true -f null - 2>&1)
+    lufs=$(grep -A6 'Integrated loudness' <<<"$eb" | grep -m1 ' I: ' | grep -oE '\-?[0-9.]+')
+    peak=$(grep -A3 'True peak' <<<"$eb" | grep -m1 'Peak:' | grep -oE '\-?[0-9.]+')
+
+    delta=""
+    if [[ -n "$full" && -n "$hi" ]]; then
+      delta=$(python3 -c "print(round($hi-($full),1))" 2>/dev/null)
+    fi
+
+    # Verdicts, worst-first.
+    local verdict="" vcol="$c_ok"
+    if [[ -n "$delta" ]]; then
+      if   (( $(python3 -c "print(1 if $delta <= -55 else 0)") )); then
+        verdict="lossy source (~<128k)"; vcol="$c_er"
+      elif (( $(python3 -c "print(1 if $delta <= -50 else 0)") )); then
+        verdict="marginal HF"; vcol="$c_wa"
+      else
+        verdict="ok"; vcol="$c_ok"
+      fi
+    else verdict="unanalysed"; vcol="$c_dm"; fi
+
+    # Dual mono: two identical channels, i.e. no stereo image at all on a
+    # club rig. Tested via the SIDE signal (L-R): if it is effectively
+    # silent the channels are identical. Comparing per-channel RMS instead
+    # is wrong — a wide stereo mix can have near-equal RMS per channel.
+    if [[ "$ch" == "2" ]]; then
+      local side
+      side=$(ffmpeg -hide_banner -nostats "${seek[@]}" -i "$f" \
+        -af "pan=mono|c0=0.5*FL-0.5*FR,volumedetect" -f null - 2>&1 \
+        | grep -m1 mean_volume | sed 's/.*mean_volume: *//' | grep -oE '^\-?[0-9.]+')
+      if [[ -n "$side" ]] && (( $(python3 -c "print(1 if $side < -70 else 0)" 2>/dev/null || echo 0) )); then
+        verdict="$verdict, dual-mono"; [[ "$vcol" == "$c_ok" ]] && vcol="$c_wa"
+      fi
+    elif [[ "$ch" == "1" ]]; then
+      verdict="$verdict, MONO"; [[ "$vcol" == "$c_ok" ]] && vcol="$c_wa"
+    fi
+
+    # True peak over 0 dBTP will clip on D/A conversion and on the CDJ's
+    # own limiter. Common in loud masters, but you want to know before it
+    # is in the mix.
+    if [[ -n "$peak" ]] && (( $(python3 -c "print(1 if $peak > 0.0 else 0)" 2>/dev/null || echo 0) )); then
+      verdict="$verdict, +peak"; [[ "$vcol" == "$c_ok" ]] && vcol="$c_wa"
+    fi
+
+    printf "%-34.34s %-6s %5s %7s %7s  %s%s%s\n" \
+      "$base" "$codec" "$((${sr:-0}/1000))" "${lufs:-?}" "${peak:-?}" "$vcol" "$verdict" "$c_rs"
+  done
+  printf "%sHF delta thresholds: >-50 ok · -50..-55 marginal · <-55 lossy source%s\n" "$c_dm" "$c_rs"
+}
+
 # ── housekeeping ──────────────────────────────────────────────────────────
 cmd_ls() {
   local count; count=$(find "$INCOMING" -type f \
@@ -191,6 +286,7 @@ case "${1:-help}" in
   get|g)     shift; cmd_get "$@" ;;
   sync)      shift; cmd_sync "$@" ;;
   spotify|sp) shift; cmd_spotify "$@" ;;
+  vet|v)     shift; cmd_vet "$@" ;;
   ls|list)   cmd_ls ;;
   update|up) cmd_update ;;
   doctor|dr) cmd_doctor ;;
@@ -203,6 +299,9 @@ ${c_hd}djdl${c_rs} — rekordbox-oriented music acquisition
   ${c_hd}get${c_rs} <url>...                    download URLs directly
   ${c_hd}sync${c_rs} <playlist> [name]          idempotent playlist sync
   ${c_hd}spotify${c_rs} <url>                   Spotify playlist via spotdl
+  ${c_hd}vet${c_rs} [dir]                       quality gate: detects lossy
+                                   sources laundered into FLAC, dual-mono,
+                                   clipping; reports LUFS for gain staging
   ${c_hd}ls${c_rs}                              what's staged in Incoming
   ${c_hd}update${c_rs}                          yt-dlp -> nightly
   ${c_hd}doctor${c_rs}                          health check
