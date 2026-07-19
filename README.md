@@ -137,6 +137,84 @@ djdl vet                            # check what landed
 open ~/Music/DJ/Incoming            # drag into rekordbox
 ```
 
+## Updating
+
+There are **three independent things** that update on different schedules. Updating one does not
+update the others, and the one that breaks most often is not the one you'd guess.
+
+### 1. yt-dlp — the one that actually matters day to day
+
+```bash
+djdl update
+```
+
+This is the fix for roughly every "it suddenly stopped working". YouTube changes break extraction
+regularly and the fix ships in nightly, often days before it reaches a stable release. **Run this
+before debugging anything else** — a stale binary is the single most common cause of failure, and
+it is indistinguishable from a real bug until you rule it out.
+
+### 2. djdl itself
+
+**If you installed with `install.sh` (the default), the three commands are symlinks into your
+clone, so this is all you need:**
+
+```bash
+cd /path/to/merakey-muse && git pull
+```
+
+The new code is live immediately — no re-install step.
+
+**If you used `MUSE_COPY=1`, or you have standalone copies**, `git pull` updates the repo but
+**not** the installed commands. Check which you have:
+
+```bash
+ls -l ~/.local/bin/djdl ~/.local/bin/djdl-rbxml ~/.local/bin/djdl-engine
+```
+
+An arrow (`->`) means symlink and you're done after a pull. No arrow means a detached copy, and
+you must re-run the installer to pick up changes:
+
+```bash
+cd /path/to/merakey-muse && git pull && ./install.sh
+```
+
+Re-running `install.sh` is always safe — it is idempotent.
+
+### 3. Dependencies — only when a release adds one
+
+`git pull` does not install new dependencies. If a release adds one, re-run `./install.sh`; it
+detects what is missing and skips what is already present. To refresh Essentia specifically:
+
+```bash
+VIRTUAL_ENV=~/.local/share/muse-venv uv pip install --upgrade essentia
+```
+
+Keep ffmpeg current independently — `brew upgrade ffmpeg`. This is a **security** update, not a
+feature one: see the [8.1.2 floor](#1-prerequisites). `djdl doctor` re-checks it.
+
+### The config file is deliberately never updated
+
+`install.sh` will **not** overwrite `~/Music/DJ/yt-dlp.conf` once it exists, on any re-run. That
+file is the whole point of the tool and silently replacing a tuned copy would be destructive.
+
+The tradeoff is that **config improvements do not reach you automatically.** After pulling a
+release that changed it, diff and merge by hand:
+
+```bash
+diff ~/Music/DJ/yt-dlp.conf /path/to/merakey-muse/config/yt-dlp.conf
+```
+
+`install.sh` prints this exact command when it detects an existing config.
+
+### After any update
+
+```bash
+djdl doctor
+```
+
+Confirms versions, the ffmpeg security floor, the yt-dlp advisory floor, plugin directories, and
+that extraction still works.
+
 ## Suggested workflow
 
 ```
