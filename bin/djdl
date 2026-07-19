@@ -519,6 +519,44 @@ than importing the playlist node, or the update is silently skipped.
 EOF
 }
 
+# ── usb ───────────────────────────────────────────────────────────────────
+# Prepares tracks for a CDJ/XDJ USB. This is the app-mediated path: we supply
+# analysed metadata (key, BPM, a load cue) via XML and let rekordbox write the
+# actual USB, because no open tool can write a working export.pdb + ANLZ that a
+# CDJ will trust — and a hand-written one can fail to load in front of a crowd.
+# rekordbox owns the beatgrid and waveform generation (it is genuinely best at
+# both); we own the key (Essentia beats rekordbox's ~70%) and the load cue.
+cmd_usb() {
+  [[ -f "$ANALYSIS" ]] || { info "no analysis yet — running it first"; cmd_analyze "$INCOMING" >/dev/null; }
+  cmd_rbxml "$@" >/dev/null || return 1
+  local n; n=$(find "$INCOMING" -type f \( -name '*.flac' -o -name '*.m4a' -o -name '*.mp3' \) | wc -l | tr -d ' ')
+  cat <<EOF
+${c_hd}USB export — $n track(s) staged with key, BPM and a load cue${c_rs}
+
+The XML is at ${DJ_ROOT}/rekordbox.xml. rekordbox writes the USB (nothing open
+can write a CDJ-trustworthy USB directly, and a bad one won't load mid-set).
+
+${c_hd}One-time, in rekordbox 7:${c_rs}
+  1. Preferences > View > Layout      -> tick "rekordbox xml"
+  2. Preferences > Analysis           -> UNtick "Key" (keep ours; rekordbox
+     key detection is ~70% accurate, Essentia's edma profile is better)
+  3. Preferences > Advanced > Database > rekordbox xml
+     -> Browse to ${DJ_ROOT}/rekordbox.xml
+  4. Sidebar "rekordbox xml" > select tracks > Import To Collection
+     (rekordbox builds the beatgrid + waveforms here — it owns those)
+  5. Plug in USB. In the Devices panel, drag your playlists onto the device.
+     rekordbox writes export.pdb + analysis files to the stick.
+
+${c_hd}Then it just plays:${c_rs} plug the USB into any CDJ-3000 / CDJ-2000NXS2 /
+XDJ-RX3 / XDJ-XZ. FLAC plays natively on all of them — no transcode.
+
+${c_wa}Gear check:${c_rs} XDJ-1000 mk1 and some older units do NOT read FLAC. If your
+booth has those, transcode first (ask: "djdl transcode for old gear").
+${c_dm}Beatgrid note: we deliberately let rekordbox grid. Our BPM (in the XML) is
+an independent cross-check — if rekordbox's grid looks off, compare the two.${c_rs}
+EOF
+}
+
 # ── housekeeping ──────────────────────────────────────────────────────────
 cmd_ls() {
   local count; count=$(find "$INCOMING" -type f \
@@ -600,6 +638,7 @@ case "${1:-help}" in
   analyze|an) shift; cmd_analyze "$@" ;;
   gain)      shift; cmd_gain "$@" ;;
   rbxml|xml) shift; cmd_rbxml "$@" ;;
+  usb)       shift; cmd_usb "$@" ;;
   similar|sim) shift; cmd_similar "$@" ;;
   mix|next)  shift; cmd_mix "$@" ;;
   ls|list)   cmd_ls ;;
@@ -625,6 +664,7 @@ ${c_hd}djdl${c_rs} — rekordbox-oriented music acquisition
   ${c_hd}similar${c_rs} <artist>                related artists (Deezer, keyless)
   ${c_hd}gain${c_rs} [dir]                      write ReplayGain 2.0 tags
   ${c_hd}rbxml${c_rs} [dir] [out.xml]           export a rekordbox XML collection
+  ${c_hd}usb${c_rs}                             stage tracks for a CDJ/XDJ USB
   ${c_hd}ls${c_rs}                              what's staged in Incoming
   ${c_hd}update${c_rs}                          yt-dlp -> nightly
   ${c_hd}doctor${c_rs}                          health check

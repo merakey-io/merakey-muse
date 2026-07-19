@@ -85,7 +85,9 @@ def load_analysis(dj_root):
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 5 and parts[0] != "path":
                 try:
-                    out[parts[0]] = (float(parts[1]), parts[4])
+                    # (bpm, classical_key, cue1_seconds_or_None)
+                    cue = float(parts[6]) if len(parts) >= 7 and parts[6] else None
+                    out[parts[0]] = (float(parts[1]), parts[4], cue)
                 except ValueError:
                     pass
     return out
@@ -149,7 +151,16 @@ def build(files, dj_root, playlist_name):
         # ElementTree escapes &, <, > and quotes in attribute values for us —
         # unescaped "&" in an artist name is the top cause of a hard parse
         # failure ("unable to be read properly").
-        ET.SubElement(collection, "TRACK", **{k: str(v) for k, v in attrs.items()})
+        track_el = ET.SubElement(collection, "TRACK", **{k: str(v) for k, v in attrs.items()})
+
+        # One memory cue at the first solid downbeat, so the CDJ loads to the
+        # first beat instead of 0:00. POSITION_MARK Type="0" = cue, Num="-1" =
+        # memory cue (0..7 would be hot cues A..H). Start is seconds with
+        # decimals. Deliberately no TEMPO/beatgrid element — see load_analysis.
+        if path in bpms and bpms[path][2] is not None:
+            ET.SubElement(track_el, "POSITION_MARK",
+                          Name="Load", Type="0",
+                          Start=f"{bpms[path][2]:.3f}", Num="-1")
         tracks.append(str(i))
 
     collection.set("Entries", str(len(tracks)))

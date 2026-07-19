@@ -143,23 +143,51 @@ def score(seed, cand, keylock=False):
 
 
 # ── analysis ──────────────────────────────────────────────────────────────
+def first_cue(beats):
+    """A robust load-cue position (seconds), NOT beats[0].
+
+    beats[0] is a single noisy detection and is often a faint pre-roll onset.
+    We take the first beat that is followed by a run of evenly-spaced beats —
+    i.e. where the actual groove has locked in — so the cue lands on a real
+    downbeat-ish hit a DJ would want the needle on, not on intro noise.
+    """
+    import numpy as np
+    b = np.asarray(beats, dtype=float)
+    if len(b) < 8:
+        return float(b[0]) if len(b) else 0.0
+    d = np.diff(b)
+    med = np.median(d)
+    for i in range(len(d) - 4):
+        # four consecutive intervals within 8% of the median tempo
+        if np.all(np.abs(d[i:i + 4] - med) < med * 0.08):
+            return float(b[i])
+    return float(b[0])
+
+
 def analyze(paths, lo=110, hi=180):
     import essentia.standard as es
-    print("path\tbpm\tconf\tcamelot\tclassical\tkeyconf")
+    # cue1 (seconds) is appended so old readers that split on the first six
+    # columns keep working; djdl-rbxml reads it by index with a guard.
+    print("path\tbpm\tconf\tcamelot\tclassical\tkeyconf\tcue1")
     for p in paths:
         try:
             audio = es.MonoLoader(filename=p, sampleRate=44100)()
-            bpm, _, conf, _, _ = es.RhythmExtractor2013(
+            bpm, beats, conf, _, _ = es.RhythmExtractor2013(
                 method="multifeature", minTempo=lo, maxTempo=hi)(audio)
             k1, s1, st1 = es.KeyExtractor(profileType="edma")(audio)
             k2, s2, _   = es.KeyExtractor(profileType="bgate")(audio)
             cam = CAMELOT.get((k1, s1), "?")
             # Profile disagreement is the honest signal that the key is a guess.
             agree = (k1, s1) == (k2, s2)
+            # We deliberately do NOT emit a beatgrid. rekordbox is authoritative
+            # for beatgrids and generates an excellent one on import; our beat
+            # positions carry ~0.6 BPM of drift on real tracks, and a wrong grid
+            # is worse than none (the CDJ shows beats in the wrong place). We
+            # supply what we're better at — key — plus one load cue.
             print(f"{p}\t{bpm:.2f}\t{conf:.2f}\t{cam}\t{CLASSICAL.get(cam,'')}"
-                  f"\t{st1:.2f}{'' if agree else '*'}")
+                  f"\t{st1:.2f}{'' if agree else '*'}\t{first_cue(beats):.3f}")
         except Exception as ex:
-            print(f"{p}\t?\t?\t?\t?\t{type(ex).__name__}", file=sys.stderr)
+            print(f"{p}\t?\t?\t?\t?\t{type(ex).__name__}\t", file=sys.stderr)
 
 
 # ── discovery ─────────────────────────────────────────────────────────────

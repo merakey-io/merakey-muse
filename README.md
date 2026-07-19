@@ -220,18 +220,25 @@ that extraction still works.
 ## Suggested workflow
 
 ```
-search  →  vet  →  scan  →  analyze  →  mix  →  rbxml  →  import
+search  →  vet  →  scan  →  analyze  →  mix  →  usb
 ```
 
 ```bash
 djdl search -m "…"     # acquire
 djdl vet               # is it actually lossless? delete the flagged junk
 djdl scan              # is it structurally sound and actually audio?
-djdl analyze           # BPM + key, cached to .analysis.tsv
+djdl analyze           # BPM + key + a load cue, cached to .analysis.tsv
 djdl mix "<track>"     # what follows it — sanity-check the crate hangs together
-djdl rbxml             # emit rekordbox.xml carrying those keys
-                       # import in rekordbox, let it build beatgrids
+djdl usb               # stage key / BPM / load-cue as rekordbox XML, then follow
+                       # the printed steps to Export to Device — rekordbox writes
+                       # the USB and builds the beatgrids
 ```
+
+The final step is a **rekordbox export**, not a direct USB write: `djdl usb` hands rekordbox an
+XML collection carrying the key, BPM and load cue, and rekordbox's own *Export to Device* writes
+the stick. Why it is done that way is the whole of
+[Exporting to CDJ/XDJ USB](#exporting-to-cdjxdj-usb). (`djdl rbxml` remains the path when you only
+want tracks in the laptop collection, no USB.)
 
 Vetting and scanning **before** import matters more than it sounds: once rekordbox has analysed
 a track and written it into the collection, removing it cleanly is far more annoying than never
@@ -314,7 +321,8 @@ One rule, correct for YouTube and SoundCloud alike. Nothing that leaves this too
 | `djdl mix <track\|bpm camelot>` | Rank the analysed library by what mixes next. |
 | `djdl similar <artist>` | Related artists via Deezer. Keyless — no signup, no token, no OAuth. |
 | `djdl gain [dir]` | Write ReplayGain 2.0 tags via `rsgain`. Read the caveat — **rekordbox ignores these**. |
-| `djdl rbxml [dir] [out.xml]` | Export a rekordbox-importable XML collection, carrying detected keys. |
+| `djdl rbxml [dir] [out.xml]` | Export a rekordbox-importable XML collection, carrying detected keys and a load cue (no beatgrid — rekordbox builds that). |
+| `djdl usb` | Stage the library for a Pioneer/AlphaTheta USB: emit rekordbox XML with key, BPM and a load cue, then print the exact rekordbox 7 steps to write the stick. App-mediated — rekordbox writes the USB. See [Exporting to CDJ/XDJ USB](#exporting-to-cdjxdj-usb). |
 | `djdl ls` | What's staged in `Incoming`, with sizes and archive count. |
 | `djdl update` | `yt-dlp --update-to nightly`. First thing to try when extraction breaks. |
 | `djdl doctor` | Health check — versions, config, free space, supply-chain checks, live extractor probe. |
@@ -981,6 +989,15 @@ So you can untick **KEY** in **Preferences → Analysis** and use these instead,
 Note the division of labour precisely: **rekordbox stays authoritative for the beatgrid**, not
 for key.
 
+### It sets a load cue at the first solid downbeat
+
+If `.analysis.tsv` carries a cue position, `rbxml` writes one memory cue per track as a
+`POSITION_MARK Type="0" Num="-1"`, so the CDJ **loads to the first beat instead of 0:00**. The
+position is not the first raw beat — that is frequently faint intro noise — but the first beat
+followed by a run of four evenly-spaced beats, i.e. where the groove locks in (see
+[the load cue](#the-load-cue-where-the-groove-locks-in-not-000)). No beatgrid is emitted with it;
+rekordbox still builds that.
+
 ### TEMPO elements are deliberately not emitted
 
 `AverageBpm` is written — it is useful for sorting and filtering. **`TEMPO` (beatgrid) elements
@@ -1011,6 +1028,103 @@ From Pioneer's `xml_format_list.pdf`, confirmed against a real binary:
   matters most.
 - Attribute values are escaped by ElementTree. An unescaped `&` in an artist name is the top
   cause of a hard parse failure ("unable to be read properly").
+
+## Exporting to CDJ/XDJ USB
+
+```bash
+djdl usb
+```
+
+`djdl usb` stages your library for a Pioneer/AlphaTheta USB. It generates a rekordbox XML
+collection carrying the **key**, **BPM** and a **load cue** for every analysed track (running
+`djdl analyze` first if there is no cache yet), then prints the exact rekordbox 7 steps to write
+the stick. It does **not** touch a USB itself — and that is a deliberate design decision, not a
+missing feature.
+
+### Why it goes through rekordbox instead of writing the USB directly
+
+A CDJ USB is not a folder of files. It is a rekordbox database (`export.pdb`) plus a set of
+per-track `ANLZ` analysis files (beatgrid, waveform, cues), in an undocumented binary format the
+player reads directly.
+
+**No open-source tool can write a working one.** This was researched, not assumed:
+
+- **pyrekordbox, crate-digger, rekordcrate and Mixxx are all read-only** for the USB export
+  format — they parse `export.pdb`/`ANLZ` to *read* an existing stick, none of them writes one.
+- **pyrekordbox's own documentation lists writing the analysis files as "planned"** — i.e. not
+  implemented.
+- The only software that writes a standalone rekordbox USB is **closed and commercial** (Lexicon).
+
+The failure mode is what makes this matter: a database that is even slightly malformed can make
+the **whole stick unreadable**, and you find out **mid-set**, in the booth, with the next track
+already cued. So `djdl usb` routes through rekordbox's own **Export to Device**, which is
+Pioneer-supported and reliable, and confines itself to supplying the metadata it is genuinely
+better at.
+
+One fact worth stating honestly, because it changes what "direct write" is: **`export.pdb` is not
+encrypted**. Rekordbox's *local* library (`master.db`) is SQLCipher-encrypted, but the exported
+USB database is not — so direct writing is *possible in principle*. It is an **effort-and-
+reliability problem, not a locked door**. Direct USB writing is a documented future R&D bet; it is
+**not shipped**, and app-mediated export is the reliable path today.
+
+### The division of labour — the key design point
+
+**rekordbox owns the beatgrid and the waveforms.** `djdl usb` deliberately emits **no `TEMPO`
+element**. This is from measurement, not caution: our beat positions (Essentia) carry roughly
+**0.6 BPM of drift** on real tracks, and a single-anchor constant grid **drifted 175 ms by the
+end of a 6-minute track** in testing. A *wrong* grid is worse than none — the CDJ draws beats in
+the wrong place and *trusts* them, so you mix against a lie. rekordbox's beatgrid is genuinely
+excellent and is the hard part to get right, so we let it do that. Our BPM still ships in the XML
+as an **independent cross-check** — if rekordbox's grid ever looks off, compare the two numbers.
+
+**We own the key.** Essentia's `edma` profile beats rekordbox's key detection (which benchmarks
+around **70%**), so the workflow tells you to **untick "Key"** in rekordbox's Analysis preferences
+and keep ours.
+
+**We own the load cue.** `analyze` computes a load-cue position — **not** the first raw beat,
+which is often faint intro noise, but the first beat followed by a run of four evenly-spaced
+beats, i.e. where the groove locks in. On a real psytrance track it landed at **9.97 s** — the
+kick drop after an atmospheric intro, exactly **0 ms** off a real beat — and ships as a
+`POSITION_MARK Type="0" Num="-1"` memory cue so the CDJ loads to the first beat instead of 0:00.
+
+#### The load cue: where the groove locks in, not 0:00
+
+The cue is chosen by `first_cue` in `djdl-engine`: it scans the detected beats for the first one
+whose next four inter-beat intervals all sit within 8% of the median tempo, and marks that
+position. `beats[0]` alone is a single noisy onset — a pre-roll tick, a stray transient in the
+intro — and cueing to it drops the needle before the track has anything to ride. Locking onto the
+first *sustained* pulse puts the load point where a DJ would actually want it.
+
+### Gear and format compatibility
+
+| Unit | FLAC | Note |
+|---|---|---|
+| CDJ-3000, CDJ-2000NXS2, XDJ-RX3, XDJ-XZ | ✅ native | **no transcode needed** — the FLAC library plays as-is |
+| XDJ-1000 mk1 and some older units | ❌ | do **not** read FLAC — need a transcode first |
+
+Transcoding for pre-FLAC gear is a **known gap**: a `djdl transcode` command is **not yet built**.
+If your booth has older units, convert the FLACs to a format they read (AIFF/WAV) with ffmpeg
+before exporting.
+
+**Filesystem for the stick:** format the USB as **FAT32** for maximum CDJ compatibility (with its
+**4 GB per-file cap**), or **exFAT** if you need larger individual files. CDJs do **not** read
+NTFS.
+
+### The rekordbox 7 steps
+
+`djdl usb` prints these itself, filled in with your actual paths:
+
+1. **Preferences → View → Layout** → tick **rekordbox xml**.
+2. **Preferences → Analysis** → **untick "Key"** (keep ours; rekordbox key detection is ~70%
+   accurate, Essentia's `edma` profile is better).
+3. **Preferences → Advanced → Database → rekordbox xml** → Browse to `~/Music/DJ/rekordbox.xml`.
+4. Sidebar **rekordbox xml** → select tracks → **Import To Collection**. rekordbox builds the
+   **beatgrid and waveforms here** — it owns those.
+5. Plug in the USB. In the **Devices** panel, **drag your playlists onto the device**. rekordbox
+   writes `export.pdb` and the analysis files to the stick.
+
+Then it just plays: the USB drops into any CDJ-3000 / CDJ-2000NXS2 / XDJ-RX3 / XDJ-XZ, FLAC and
+all.
 
 ## Gotchas discovered the hard way
 
@@ -1091,6 +1205,17 @@ queue. It was researched and rejected: **the radio returns roughly 68% the seed 
 That makes it a **discography expander**, not a discovery tool. It is a reasonable feature to
 have, but it is not the feature it appears to be, and shipping it as "find similar music" would
 misrepresent what it does. `djdl similar` (Deezer) is the discovery path.
+
+### USB export is app-mediated by design
+
+- **Direct USB writing is not implemented.** `djdl usb` stages metadata and hands off to
+  rekordbox's *Export to Device*; it never writes `export.pdb`/`ANLZ` itself. No open tool writes
+  a CDJ-trustworthy USB, and a malformed one fails mid-set — full reasoning in
+  [Exporting to CDJ/XDJ USB](#exporting-to-cdjxdj-usb). Direct write is a future R&D bet, not shipped.
+- **No beatgrid is emitted, on purpose.** We ship key, BPM and a load cue but no `TEMPO` element;
+  rekordbox builds the authoritative grid on import.
+- **No transcode for pre-FLAC gear yet.** XDJ-1000 mk1 and some older units do not read FLAC, and
+  a `djdl transcode` command is not built. Convert with ffmpeg in the meantime.
 
 ### Scope limits carried over
 
