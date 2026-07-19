@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# djdl — rekordbox-oriented music acquisition workflow around yt-dlp
+# Layout:  ~/Music/DJ/{Incoming,.archive.txt,yt-dlp.conf}
+set -uo pipefail
+
+DJ_ROOT="${DJ_ROOT:-$HOME/Music/DJ}"
+YTDLP="${YTDLP:-$HOME/.local/bin/yt-dlp}"
+INCOMING="$DJ_ROOT/Incoming"
+
+c_hd=$'\033[1;36m'; c_ok=$'\033[0;32m'; c_wa=$'\033[0;33m'
+c_er=$'\033[0;31m'; c_dm=$'\033[0;90m'; c_rs=$'\033[0m'
+
+die()  { printf "%s✗ %s%s\n" "$c_er" "$*" "$c_rs" >&2; exit 1; }
+info() { printf "%s→ %s%s\n" "$c_dm" "$*" "$c_rs" >&2; }
+ok()   { printf "%s✓ %s%s\n" "$c_ok" "$*" "$c_rs" >&2; }
+
+[[ -x "$YTDLP" ]] || die "yt-dlp not found at $YTDLP"
+mkdir -p "$INCOMING"
+
+# Metadata rules live here, NOT in yt-dlp.conf: that parser strips backslashes
+# and lets a multi-arg option swallow the next line as a missing argument,
+# which silently produces raw untouched tags. Shell quoting is unambiguous.
+META_ARGS=(
+  # YouTube dumps the entire video description into comment/description/synopsis.
+  # Left alone, that whole wall of text lands in rekordbox's comment column.
+  --parse-metadata ":(?P<meta_comment>)"
+  --parse-metadata ":(?P<meta_description>)"
+  --parse-metadata ":(?P<meta_synopsis>)"
+
+  # Strip title junk. Each bracket must match a junk phrase in FULL, so
+  # DJ-critical suffixes — (Extended Mix), (Original Mix), (X Remix) — survive.
+  --replace-in-metadata title \
+    '(?i)\s*[\(\[]\s*(official\s+(music\s+)?(video|audio)|official\s+visuali[sz]er|lyrics?\s*video|lyrics?|visuali[sz]er|audio only|hd|hq|4k|1080p|free\s+dl|free\s+download|out\s+now|music\s+video)\s*[\)\]]' ''
+  # Trailing "| Label / TikTok 2020" tails.
+  --replace-in-metadata title '\s*\|\s*[^|]*$' ''
+  --replace-in-metadata title '\s+$' ''
+
+  # Split "Artist - Title". Non-greedy, so the FIRST " - " wins:
+  # "Artist - Title - Remix" -> artist="Artist", not "Artist - Title".
+  # No match (no " - ") is a silent no-op; artist then falls back to
+  # uploader via the output template in yt-dlp.conf.
+  --parse-metadata 'title:(?P<artist>.+?) - (?P<title>.+)'
+)
+
+# All real work funnels through here so -P, the config and META_ARGS are
+# never forgotten by an individual subcommand.
+# --download-archive must be absolute: -P governs output paths but not the
+# archive, so a relative path resolves against CWD and scatters .archive.txt
+# across whatever directory you invoked from.
+run_dl() {
+  "$YTDLP" -P "$DJ_ROOT" --download-archive "$DJ_ROOT/.archive.txt" \
+    "${META_ARGS[@]}" "$@"
+}
+
+# ── search ────────────────────────────────────────────────────────────────
+# Queries a provider, renders a numbered table, downloads the chosen rows.
+cmd_search() {
+  local provider="ytsearch" n=12
+  while [[ "${1:-}" == -* ]]; do
+    case "$1" in
+      -m|--music) provider="ytmsearch"; shift ;;   # YouTube Music: cleaner tags
+      -s|--sc)    provider="scsearch";  shift ;;   # SoundCloud: edits & bootlegs
+      -n)         n="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || die "usage: djdl search [-m|-s] [-n N] <query>"
+
+  local query="$*"
+  info "searching ${provider%search} for \"$query\" ..."
+  local json
+  json=$("$YTDLP" -q --no-warnings --flat-playlist -j "${provider}${n}:${query}" 2>/dev/null)
+  [[ -n "$json" ]] || die "no results (or extractor blocked — try: djdl update)"
+
+  local -a urls=() titles=()
+  local i=0
+  while IFS=$'\t' read -r url dur uploader title; do
+    i=$((i+1)); urls+=("$url"); titles+=("$title")
+    local mmss="?:??"
+    [[ "$dur" =~ ^[0-9]+$ ]] && mmss=$(printf "%d:%02d" $((dur/60)) $((dur%60)))
+
+    # Flag uploads that are unusable in a DJ set. Pitch/tempo-altered rips are
+    # the dangerous ones: rekordbox will happily analyse them and report a key
+    # and BPM that are simply wrong, so they poison harmonic mixing silently.
+    local warn=""
+    case "$title" in
+      *432*|*432[Hh]z*)                          warn="pitch-shifted" ;;
+      *[Nn]ightcore*|*[Ss]ped[\ _-][Uu]p*)       warn="tempo-altered" ;;
+      *[Ss]lowed*|*[Rr]everb*)                   warn="tempo-altered" ;;
+    esac
+    # A music track running far past ~12 min is almost always a loop or a mix.
+    [[ -z "$warn" && "$dur" =~ ^[0-9]+$ && $dur -gt 720 ]] && warn="long/loop?"
+    [[ "$title" == *[Ll]ive* ]] && [[ -z "$warn" ]] && warn="live rip"
+
+    local wtag=""
+    [[ -n "$warn" ]] && wtag=$(printf "%s ⚠ %-13s%s" "$c_wa" "$warn" "$c_rs")
+    printf "%s%3d%s  %s%-7s%s %s%-20.20s%s %s%.52s\n" \
+      "$c_hd" "$i" "$c_rs" "$c_dm" "$mmss" "$c_rs" "$c_dm" "${uploader:0:20}" "$c_rs" "$wtag" "$title"
+  done < <(echo "$json" | jq -r '[(.url // .webpage_url // ("https://youtu.be/"+.id)), (.duration//"?"), (.uploader // .channel // .uploader_id // "?"), .title] | @tsv')
+
+  [[ $i -gt 0 ]] || die "no parseable results"
+  printf "\n%sPick: numbers (1 3 5), range (1-4), 'a' all, Enter cancel: %s" "$c_hd" "$c_rs" >&2
+  local pick=""
+  if [[ -r /dev/tty ]]; then read -r pick </dev/tty || true; else read -r pick || true; fi
+  [[ -n "${pick// }" ]] || { info "cancelled"; return 0; }
+
+  local -a sel=()
+  if [[ "$pick" == "a" ]]; then
+    sel=("${urls[@]}")
+  else
+    for tok in $pick; do
+      if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        for ((k=${BASH_REMATCH[1]}; k<=${BASH_REMATCH[2]}; k++)); do
+          [[ $k -ge 1 && $k -le $i ]] && sel+=("${urls[$((k-1))]}")
+        done
+      elif [[ "$tok" =~ ^[0-9]+$ && $tok -ge 1 && $tok -le $i ]]; then
+        sel+=("${urls[$((tok-1))]}")
+      fi
+    done
+  fi
+  [[ ${#sel[@]} -gt 0 ]] || die "nothing selected"
+  info "downloading ${#sel[@]} track(s)"
+  run_dl "${sel[@]}"
+  ok "done → $INCOMING"
+}
+
+# ── get ───────────────────────────────────────────────────────────────────
+cmd_get() {
+  [[ $# -gt 0 ]] || die "usage: djdl get <url> [url...]"
+  run_dl "$@" && ok "done → $INCOMING"
+}
+
+# ── sync ──────────────────────────────────────────────────────────────────
+# Idempotent playlist sync. Re-run any time; the archive skips what you have.
+# Note: deliberately NO --break-on-existing — it aborts at the first known
+# track, which silently skips everything after a mid-playlist insertion.
+cmd_sync() {
+  [[ $# -gt 0 ]] || die "usage: djdl sync <playlist-url> [folder-name]"
+  local url="$1"; local name="${2:-%(playlist_title,playlist)s}"
+  info "syncing into Playlists/$name"
+  run_dl -o "Playlists/$name/%(artist,creator,uploader)s - %(title)s.%(ext)s" "$url"
+  ok "synced → $DJ_ROOT/Playlists"
+}
+
+# ── spotify ───────────────────────────────────────────────────────────────
+# spotdl reads Spotify *metadata*, then sources the audio from YouTube.
+# It does not decrypt Spotify — the audio is a YouTube match wearing
+# Spotify tags. Wrong-version mismatches are the known failure mode.
+cmd_spotify() {
+  [[ $# -gt 0 ]] || die "usage: djdl spotify <spotify-url>"
+  command -v spotdl >/dev/null 2>&1 || die "spotdl not installed. Run: uv tool install spotdl"
+  mkdir -p "$INCOMING"
+  ( cd "$INCOMING" && spotdl download "$1" \
+      --format flac --bitrate disable \
+      --output "{artist} - {title}.{output-ext}" )
+  ok "done → $INCOMING  ${c_wa}(verify versions — YT matching is imperfect)${c_rs}"
+}
+
+# ── housekeeping ──────────────────────────────────────────────────────────
+cmd_ls() {
+  local count; count=$(find "$INCOMING" -type f \
+    \( -name '*.flac' -o -name '*.m4a' -o -name '*.mp3' -o -name '*.wav' \) 2>/dev/null | wc -l | tr -d ' ')
+  printf "%s%s track(s) in Incoming%s\n" "$c_hd" "$count" "$c_rs"
+  find "$INCOMING" -type f \( -name '*.flac' -o -name '*.m4a' -o -name '*.mp3' \) \
+    -exec ls -lh {} + 2>/dev/null | awk '{printf "  %-7s %s\n", $5, substr($0, index($0,$9))}' | sort -k2
+  printf "%sarchive: %s entries%s\n" "$c_dm" \
+    "$(wc -l < "$DJ_ROOT/.archive.txt" 2>/dev/null | tr -d ' ' || echo 0)" "$c_rs"
+}
+
+cmd_update() { "$YTDLP" --update-to nightly; }
+
+cmd_doctor() {
+  printf "%s── djdl doctor ──%s\n" "$c_hd" "$c_rs"
+  printf "  yt-dlp   %s\n" "$("$YTDLP" --version 2>/dev/null || echo MISSING)"
+  printf "  ffmpeg   %s\n" "$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}' || echo MISSING)"
+  printf "  jq       %s\n" "$(command -v jq >/dev/null && echo ok || echo MISSING)"
+  printf "  spotdl   %s\n" "$(command -v spotdl >/dev/null && echo ok || echo '- (uv tool install spotdl)')"
+  printf "  config   %s\n" "$([[ -f "$DJ_ROOT/yt-dlp.conf" ]] && echo ok || echo MISSING)"
+  printf "  free     %s\n" "$(df -h "$DJ_ROOT" | tail -1 | awk '{print $4}')"
+  info "probing YouTube extractor ..."
+  if "$YTDLP" -q --no-warnings --simulate "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>/dev/null; then
+    ok "extractor healthy (no PO token needed)"
+  else
+    printf "%s⚠ extraction failed — run 'djdl update' first; if it persists you may\n" "$c_wa"
+    printf "  need cookies (--cookies-from-browser safari) or the PO token plugin.%s\n" "$c_rs"
+  fi
+}
+
+case "${1:-help}" in
+  search|s)  shift; cmd_search "$@" ;;
+  get|g)     shift; cmd_get "$@" ;;
+  sync)      shift; cmd_sync "$@" ;;
+  spotify|sp) shift; cmd_spotify "$@" ;;
+  ls|list)   cmd_ls ;;
+  update|up) cmd_update ;;
+  doctor|dr) cmd_doctor ;;
+  *) cat <<EOF
+${c_hd}djdl${c_rs} — rekordbox-oriented music acquisition
+
+  ${c_hd}search${c_rs} [-m|-s] [-n N] <query>   search + pick + download
+                                   -m YouTube Music (cleanest tags)
+                                   -s SoundCloud   (edits, bootlegs)
+  ${c_hd}get${c_rs} <url>...                    download URLs directly
+  ${c_hd}sync${c_rs} <playlist> [name]          idempotent playlist sync
+  ${c_hd}spotify${c_rs} <url>                   Spotify playlist via spotdl
+  ${c_hd}ls${c_rs}                              what's staged in Incoming
+  ${c_hd}update${c_rs}                          yt-dlp -> nightly
+  ${c_hd}doctor${c_rs}                          health check
+
+Everything lands in ${DJ_ROOT}/Incoming as FLAC or stream-copied
+m4a/mp3 — never Opus, which rekordbox cannot import.
+EOF
+  ;;
+esac

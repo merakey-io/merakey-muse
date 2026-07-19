@@ -1,0 +1,7 @@
+.archive.txt
+*.flac
+*.m4a
+*.mp3
+*.wav
+.DS_Store
+Incoming/
